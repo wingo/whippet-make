@@ -1,15 +1,15 @@
-WHIPPET=whippet/
+GC_BASE=whippet/
 
 GC_COLLECTOR ?= pcc
+GC_EMBEDDER_H=whippet/benchmarks/mt-gcbench-embedder.h
 
 all: mt-gcbench
 
-include $(WHIPPET)embed.mk
+include $(GC_BASE)embed.mk
 
-EMBEDDER_TO_GC_CFLAGS=-include whippet/benchmarks/mt-gcbench-embedder.h
 
 mt-gcbench.o: whippet/benchmarks/mt-gcbench.c
-	$(GC_COMPILE) $(GC_TO_EMBEDDER_CFLAGS) -c $<
+	$(GC_COMPILE) -c $<
 mt-gcbench: mt-gcbench.o $(GC_OBJS)
 	$(GC_LINK) $^ $(GC_LIBS)
 
