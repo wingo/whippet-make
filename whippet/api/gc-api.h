@@ -42,6 +42,10 @@ struct gc_heap_roots;
 GC_API_ void gc_heap_set_roots(struct gc_heap *heap,
                                struct gc_heap_roots *roots);
 
+GC_API_ void gc_heap_set_allocation_failure_handler(struct gc_heap *heap,
+                                                    void* (*)(struct gc_heap*,
+                                                              size_t));
+
 struct gc_extern_space;
 GC_API_ void gc_heap_set_extern_space(struct gc_heap *heap,
                                       struct gc_extern_space *space);
@@ -49,11 +53,19 @@ GC_API_ void gc_heap_set_extern_space(struct gc_heap *heap,
 GC_API_ struct gc_mutator* gc_init_for_thread(struct gc_stack_addr base,
                                               struct gc_heap *heap);
 GC_API_ void gc_finish_for_thread(struct gc_mutator *mut);
-GC_API_ void* gc_call_without_gc(struct gc_mutator *mut, void* (*f)(void*),
-                                 void *data) GC_NEVER_INLINE;
+GC_API_ void gc_deactivate(struct gc_mutator *mut);
+GC_API_ void gc_reactivate(struct gc_mutator *mut);
+GC_API_ void* gc_deactivate_for_call(struct gc_mutator *mut,
+                                     void* (*f)(struct gc_mutator*, void*),
+                                     void *data);
+GC_API_ void* gc_reactivate_for_call(struct gc_mutator *mut,
+                                     void* (*f)(struct gc_mutator*, void*),
+                                     void *data);
 
 GC_API_ void gc_collect(struct gc_mutator *mut,
                         enum gc_collection_kind requested_kind);
+
+GC_API_ int gc_heap_contains(struct gc_heap *heap, struct gc_ref ref);
 
 static inline void gc_update_alloc_table(struct gc_ref obj, size_t size,
                                          enum gc_allocation_kind kind) GC_ALWAYS_INLINE;
@@ -136,6 +148,7 @@ static inline void* gc_allocate_small_fast_freelist(struct gc_mutator *mut,
     return NULL;
 
   *freelist_loc = *(void**)head;
+  *(void**)head = NULL;
 
   gc_update_alloc_table(gc_ref_from_heap_object(head), size, kind);
 
@@ -149,12 +162,12 @@ static inline void* gc_allocate_small_fast(struct gc_mutator *mut, size_t size,
   GC_ASSERT(size != 0);
   GC_ASSERT(size <= gc_allocator_large_threshold());
 
-  switch (gc_allocator_kind()) {
-  case GC_ALLOCATOR_INLINE_BUMP_POINTER:
+  switch (gc_inline_allocator_kind(kind)) {
+  case GC_INLINE_ALLOCATOR_BUMP_POINTER:
     return gc_allocate_small_fast_bump_pointer(mut, size, kind);
-  case GC_ALLOCATOR_INLINE_FREELIST:
+  case GC_INLINE_ALLOCATOR_FREELIST:
     return gc_allocate_small_fast_freelist(mut, size, kind);
-  case GC_ALLOCATOR_INLINE_NONE:
+  case GC_INLINE_ALLOCATOR_NONE:
     return NULL;
   default:
     GC_CRASH();
@@ -292,6 +305,20 @@ static inline int gc_should_stop_for_safepoint(struct gc_mutator *mut) {
 static inline void gc_safepoint(struct gc_mutator *mut) {
   if (GC_UNLIKELY(gc_should_stop_for_safepoint(mut)))
     gc_safepoint_slow(mut);
+}
+
+GC_API_ int gc_safepoint_signal_number(void);
+GC_API_ void gc_safepoint_signal_inhibit(struct gc_mutator *mut);
+GC_API_ void gc_safepoint_signal_reallow(struct gc_mutator *mut);
+
+static inline void gc_inhibit_preemption(struct gc_mutator *mut) {
+  if (gc_safepoint_mechanism() == GC_SAFEPOINT_MECHANISM_SIGNAL)
+    gc_safepoint_signal_inhibit(mut);
+}
+
+static inline void gc_reallow_preemption(struct gc_mutator *mut) {
+  if (gc_safepoint_mechanism() == GC_SAFEPOINT_MECHANISM_SIGNAL)
+    gc_safepoint_signal_reallow(mut);
 }
 
 #endif // GC_API_H_
