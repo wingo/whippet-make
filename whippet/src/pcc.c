@@ -422,7 +422,7 @@ static inline int do_trace(struct gc_heap *heap, struct gc_edge edge,
   if (large_object_space_contains_with_lock(heap_large_object_space(heap), ref))
     return large_object_space_mark(heap_large_object_space(heap), ref);
   else
-    return gc_extern_space_visit(heap_extern_space(heap), edge, ref);
+    return gc_extern_space_visit(heap_extern_space(heap), ref);
 }
 
 static inline int trace_edge(struct gc_heap *heap, struct gc_edge edge,
@@ -461,7 +461,9 @@ int gc_visit_ephemeron_key(struct gc_edge edge, struct gc_heap *heap) {
 
   if (large_object_space_contains_with_lock(heap_large_object_space(heap), ref))
     return large_object_space_is_marked(heap_large_object_space(heap), ref);
-  GC_CRASH();
+
+  // Assume it is in the extern space.
+  return 1;
 }
 
 static int mutators_are_stopping(struct gc_heap *heap) {
@@ -1032,6 +1034,12 @@ void* gc_allocate_slow(struct gc_mutator *mut, size_t size,
 }
 
 void gc_pin_object(struct gc_mutator *mut, struct gc_ref ref) {
+  GC_CRASH();
+}
+
+struct gc_ref gc_resolve_conservative_ref(struct gc_heap *heap,
+                                          struct gc_conservative_ref ref,
+                                          int possibly_interior) {
   GC_CRASH();
 }
 

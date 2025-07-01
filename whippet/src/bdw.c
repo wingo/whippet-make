@@ -5,8 +5,10 @@
 
 #define GC_IMPL 1
 
+#include "gc-align.h"
 #include "gc-api.h"
 #include "gc-ephemeron.h"
+#include "gc-trace.h"
 #include "gc-tracepoint.h"
 
 #include "gc-internal.h"
@@ -167,6 +169,24 @@ void gc_pin_object(struct gc_mutator *mut, struct gc_ref ref) {
   // Nothing to do.
 }
 
+struct gc_ref gc_resolve_conservative_ref(struct gc_heap *heap,
+                                          struct gc_conservative_ref ref,
+                                          int possibly_interior) {
+  if (!gc_conservative_ref_might_be_a_heap_object(ref, possibly_interior))
+    return gc_ref_null();
+
+  uintptr_t start = align_down(gc_conservative_ref_value(ref),
+                               GC_INLINE_GRANULE_BYTES);
+  uintptr_t base = (uintptr_t)GC_base((void*)start);
+
+  if (!base)
+    return gc_ref_null();
+  if (possibly_interior || start == base)
+    return gc_ref(base);
+  else
+    return gc_ref_null();
+}
+
 void gc_collect(struct gc_mutator *mut,
                 enum gc_collection_kind requested_kind) {
   switch (requested_kind) {
@@ -218,14 +238,18 @@ struct bdw_mark_state {
   struct GC_ms_entry *mark_stack_limit;
 };
 
-static void bdw_mark_edge(struct gc_edge edge, struct gc_heap *heap,
-                          void *visit_data) {
+static void bdw_mark(struct gc_ref ref, struct gc_heap *heap,
+                     void *visit_data) {
   struct bdw_mark_state *state = visit_data;
-  uintptr_t addr = gc_ref_value(gc_edge_ref(edge));
-  state->mark_stack_ptr = GC_MARK_AND_PUSH ((void *) addr,
+  state->mark_stack_ptr = GC_MARK_AND_PUSH ((void *) gc_ref_value(ref),
                                             state->mark_stack_ptr,
                                             state->mark_stack_limit,
                                             NULL);
+}
+
+static void bdw_mark_edge(struct gc_edge edge, struct gc_heap *heap,
+                          void *visit_data) {
+  bdw_mark(gc_edge_ref(edge), heap, visit_data);
 }
 
 static void bdw_mark_range(uintptr_t lo, uintptr_t hi, int possibly_interior,
@@ -395,7 +419,8 @@ mark_heap(GC_word *addr, struct GC_ms_entry *mark_stack_ptr,
     return state.mark_stack_ptr;
 
   if (heap->roots) {
-    gc_trace_heap_conservative_roots(heap->roots, bdw_mark_range, heap, &state);
+    gc_trace_heap_pinned_roots(heap->roots, bdw_mark, bdw_mark_range,
+                               heap, &state);
     gc_trace_heap_roots(heap->roots, bdw_mark_edge, heap, &state);
   }
 
@@ -432,8 +457,8 @@ mark_mutator(GC_word *addr, struct GC_ms_entry *mark_stack_ptr,
   memset(mut->freelists, 0, sizeof(void*) * GC_INLINE_FREELIST_COUNT);
 
   if (mut->roots) {
-    gc_trace_mutator_conservative_roots(mut->roots, bdw_mark_range,
-                                        mut->heap, &state);
+    gc_trace_mutator_pinned_roots(mut->roots, bdw_mark, bdw_mark_range,
+                                  mut->heap, &state);
     gc_trace_mutator_roots(mut->roots, bdw_mark_edge, mut->heap, &state);
   }
 

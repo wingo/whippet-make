@@ -236,13 +236,12 @@ static int semi_space_contains(struct semi_space *space, struct gc_ref ref) {
 
 static void visit_external_object(struct gc_heap *heap,
                                   struct gc_extern_space *space,
-                                  struct gc_edge edge,
-                                  struct gc_ref old_ref) {
-  if (gc_extern_space_visit(space, edge, old_ref)) {
+                                  struct gc_ref ref) {
+  if (gc_extern_space_visit(space, ref)) {
     if (GC_UNLIKELY(heap->check_pending_ephemerons))
-      gc_resolve_pending_ephemerons(old_ref, heap);
+      gc_resolve_pending_ephemerons(ref, heap);
 
-    gc_trace_object(gc_edge_ref(edge), trace, heap, NULL, NULL);
+    gc_trace_object(ref, trace, heap, NULL, NULL);
   }
 }
 
@@ -256,7 +255,7 @@ static void visit(struct gc_edge edge, struct gc_heap *heap) {
                                                  ref))
     visit_large_object_space(heap, heap_large_object_space(heap), ref);
   else
-    visit_external_object(heap, heap->extern_space, edge, ref);
+    visit_external_object(heap, heap->extern_space, ref);
 }
 
 struct gc_pending_ephemerons *
@@ -279,7 +278,8 @@ int gc_visit_ephemeron_key(struct gc_edge edge, struct gc_heap *heap) {
   } else if (large_object_space_contains_with_lock(heap_large_object_space(heap), ref)) {
     return large_object_space_is_marked(heap_large_object_space(heap), ref);
   }
-  GC_CRASH();
+  // Assume it is in the extern space.
+  return 1;
 }
 
 static void trace(struct gc_edge edge, struct gc_heap *heap, void *visit_data) {
@@ -548,6 +548,12 @@ void* gc_allocate_slow(struct gc_mutator *mut, size_t size,
 }
 
 void gc_pin_object(struct gc_mutator *mut, struct gc_ref ref) {
+  GC_CRASH();
+}
+
+struct gc_ref gc_resolve_conservative_ref(struct gc_heap *heap,
+                                          struct gc_conservative_ref ref,
+                                          int possibly_interior) {
   GC_CRASH();
 }
 
