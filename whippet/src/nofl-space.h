@@ -1,6 +1,7 @@
 #ifndef NOFL_SPACE_H
 #define NOFL_SPACE_H
 
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include "debug.h"
 #include "extents.h"
 #include "gc-align.h"
+#include "gc-atomics.h"
 #include "gc-attrs.h"
 #include "gc-inline.h"
 #include "gc-lock.h"
@@ -36,6 +38,8 @@
 STATIC_ASSERT_EQ(NOFL_GRANULE_SIZE, 1 << NOFL_GRANULE_SIZE_LOG_2);
 STATIC_ASSERT_EQ(NOFL_MEDIUM_OBJECT_THRESHOLD,
                  NOFL_MEDIUM_OBJECT_GRANULE_THRESHOLD * NOFL_GRANULE_SIZE);
+
+#include "nofl-holeset.h"
 
 #define NOFL_SLAB_SIZE (4 * 1024 * 1024)
 #define NOFL_BLOCK_SIZE (64 * 1024)
@@ -154,8 +158,8 @@ struct nofl_space {
   uint8_t survivor_mark;
   uint8_t evacuating;
   struct extents *extents;
-  size_t heap_size;
   uint8_t last_collection_was_minor;
+  uint8_t heap_has_ambiguous_edges;
   struct nofl_block_stack empty;
   struct nofl_block_stack paged_out[NOFL_PAGE_OUT_QUEUE_SIZE];
   struct nofl_block_list to_sweep;
@@ -164,6 +168,7 @@ struct nofl_space {
   struct nofl_block_list promoted;
   struct nofl_block_list old;
   struct nofl_block_list evacuation_targets;
+  struct nofl_holeset holes;
   pthread_mutex_t lock;
   double evacuation_minimum_reserve;
   double evacuation_reserve;
@@ -175,12 +180,14 @@ struct nofl_space {
   uintptr_t survivor_granules_at_last_collection; // atomically
   uintptr_t allocated_granules_since_last_collection; // atomically
   uintptr_t fragmentation_granules_since_last_collection; // atomically
+  uintptr_t second_chance_granules_since_last_collection; // atomically
 };
 
 struct nofl_allocator {
   uintptr_t alloc;
   uintptr_t sweep;
   struct nofl_block_ref block;
+  struct nofl_holeset holes;
 };
 
 #if GC_CONSERVATIVE_TRACE && GC_CONCURRENT_TRACE
@@ -209,30 +216,30 @@ struct nofl_allocator {
 //
 // When an object becomes dead after a GC, it will still have a mark set
 // -- maybe the young mark, or maybe a survivor mark.  The sweeper has
-// to clear these marks before the next collection.  If we add
-// concurrent marking, we will also be marking "live" objects, updating
-// their mark bits.  So there are three and possibly four object states
-// concurrently observable:  young, dead, survivor, and marked.  (We
-// don't currently have concurrent marking, though.)  We store this
-// state in the low 3 bits of the byte.  After each major collection,
-// the dead, survivor, and marked states rotate.
+// to clear these marks before the next collection.  The same goes for
+// "forwarded" marks left in the metadata of evacuated objects.  If we
+// add concurrent marking, we will also be marking "live" objects,
+// updating their mark bits.  So there are three and possibly four
+// object states concurrently observable:  young, dead, survivor, and
+// marked.  (We don't currently have concurrent marking, though.)  We
+// store this state in the low 3 bits of the byte.  After each major
+// collection, the dead, survivor, and marked states rotate.
 //
 // It can be useful to support "raw" allocations, most often
 // pointerless, but for compatibility with BDW-GC, sometimes
 // conservatively-traced tagless data.  We reserve one or two bits for
 // the "kind" of the allocation: either a normal object traceable via
 // `gc_trace_object`, a pointerless untagged allocation that doesn't
-// need tracing, an allocation that should be traced conservatively, or
-// an ephemeron.  The latter two states are only used when conservative
-// tracing is enabled.
+// need tracing, an allocation that should be traced conservatively.
+// The latter state is only used when conservative tracing is enabled.
 //
 // An object can be pinned, preventing it from being evacuated during
 // collection.  Pinning does not keep the object alive; if it is
 // otherwise unreachable, it will be collected.  To pin an object, a
 // running mutator can set the pinned bit, using atomic
-// compare-and-swap.  This bit overlaps the "trace conservatively" and
-// "ephemeron" trace kinds, but that's OK because we don't use the
-// pinned bit in those cases, as all objects are implicitly pinned.
+// compare-and-swap.  This bit overlaps the "trace conservatively" trace
+// kind, but that's OK because we don't use the pinned bit in those
+// cases, as all objects are implicitly pinned.
 //
 // For generational collectors, the nofl space supports a field-logging
 // write barrier.  The two logging bits correspond to the two words in a
@@ -246,11 +253,14 @@ enum nofl_metadata_byte {
   NOFL_METADATA_BYTE_MARK_0 = 2,
   NOFL_METADATA_BYTE_MARK_1 = 3,
   NOFL_METADATA_BYTE_MARK_2 = 4,
+  NOFL_METADATA_BYTE_BUSY = 5,
+  NOFL_METADATA_BYTE_FORWARDED = 6,
+  NOFL_METADATA_BYTE_UNUSED = 7,
   NOFL_METADATA_BYTE_MARK_MASK = 7,
   NOFL_METADATA_BYTE_TRACE_PRECISELY = 0,
   NOFL_METADATA_BYTE_TRACE_NONE = 8,
   NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY = 16,
-  NOFL_METADATA_BYTE_TRACE_EPHEMERON = 24,
+  NOFL_METADATA_BYTE_TRACE_UNUSED = 24,
   NOFL_METADATA_BYTE_TRACE_KIND_MASK = 0|8|16|24,
   NOFL_METADATA_BYTE_PINNED = 16,
   NOFL_METADATA_BYTE_END = 32,
@@ -313,14 +323,14 @@ nofl_block_mark_loc(uintptr_t addr) {
 
 static int
 nofl_block_is_marked(uintptr_t addr) {
-  return atomic_load_explicit(nofl_block_mark_loc(addr), memory_order_relaxed);
+  return gc_atomic_load_relaxed(nofl_block_mark_loc(addr));
 }
 
 static void
 nofl_block_set_mark(uintptr_t addr) {
   uint8_t *loc = nofl_block_mark_loc(addr);
-  if (!atomic_load_explicit(loc, memory_order_relaxed))
-    atomic_store_explicit(loc, 1, memory_order_relaxed);
+  if (!gc_atomic_load_relaxed(loc))
+    gc_atomic_store_relaxed(loc, 1);
 }
 
 #define NOFL_GRANULES_PER_BLOCK (NOFL_BLOCK_SIZE / NOFL_GRANULE_SIZE)
@@ -419,7 +429,7 @@ nofl_allocator_has_block(struct nofl_allocator *alloc) {
 
 static struct nofl_block_ref
 nofl_block_head(struct nofl_block_list *list) {
-  uintptr_t head = atomic_load_explicit(&list->blocks, memory_order_acquire);
+  uintptr_t head = gc_atomic_load(&list->blocks);
   if (!head)
     return nofl_block_null();
   return (struct nofl_block_ref){ nofl_block_summary_for_addr(head), head };
@@ -429,11 +439,7 @@ static int
 nofl_block_compare_and_exchange(struct nofl_block_list *list,
                                 struct nofl_block_ref *expected,
                                 struct nofl_block_ref desired) {
-  if (atomic_compare_exchange_weak_explicit(&list->blocks,
-                                            &expected->addr,
-                                            desired.addr,
-                                            memory_order_acq_rel,
-                                            memory_order_acquire))
+  if (gc_atomic_cmpxchg_weak(&list->blocks, &expected->addr, desired.addr))
     return 1;
       
   expected->summary = nofl_block_summary_for_addr(expected->addr);
@@ -443,7 +449,7 @@ nofl_block_compare_and_exchange(struct nofl_block_list *list,
 static void
 nofl_block_list_push(struct nofl_block_list *list,
                      struct nofl_block_ref block) {
-  atomic_fetch_add_explicit(&list->count, 1, memory_order_acq_rel);
+  gc_atomic_fetch_add(&list->count, 1);
   GC_ASSERT(nofl_block_is_null(nofl_block_next(block)));
   struct nofl_block_ref next = nofl_block_head(list);
   do {
@@ -461,7 +467,7 @@ nofl_block_list_pop(struct nofl_block_list *list) {
     next = nofl_block_next(head);
   } while (!nofl_block_compare_and_exchange(list, &head, next));
   nofl_block_set_next(head, nofl_block_null());
-  atomic_fetch_sub_explicit(&list->count, 1, memory_order_acq_rel);
+  gc_atomic_fetch_sub(&list->count, 1);
   return head;
 }
 
@@ -492,7 +498,7 @@ nofl_block_stack_pop(struct nofl_block_stack *stack,
 
 static size_t
 nofl_block_count(struct nofl_block_list *list) {
-  return atomic_load_explicit(&list->count, memory_order_acquire);
+  return gc_atomic_load(&list->count);
 }
 
 static void
@@ -559,13 +565,18 @@ nofl_active_block_count(struct nofl_space *space) {
   return total - unavailable;
 }
 
+static size_t
+nofl_evacuation_block_count(struct nofl_space *space) {
+  return nofl_block_count(&space->evacuation_targets);
+}
+
 static int
 nofl_maybe_push_evacuation_target(struct nofl_space *space,
                                   struct nofl_block_ref block,
                                   double reserve) {
-  size_t targets = nofl_block_count(&space->evacuation_targets);
+  size_t targets = nofl_evacuation_block_count(space);
   size_t active = nofl_active_block_count(space);
-  if (targets >= active * reserve)
+  if (targets >= ceil(active * reserve))
     return 0;
 
   nofl_block_list_push(&space->evacuation_targets, block);
@@ -602,6 +613,12 @@ nofl_allocator_reset(struct nofl_allocator *alloc) {
   alloc->block = nofl_block_null();
 }
 
+static void
+nofl_allocator_init(struct nofl_allocator *alloc) {
+  nofl_allocator_reset(alloc);
+  nofl_holeset_clear(&alloc->holes);
+}
+
 static int
 nofl_should_promote_block(struct nofl_space *space,
                           struct nofl_block_ref block) {
@@ -619,12 +636,12 @@ nofl_allocator_release_full_block(struct nofl_allocator *alloc,
   GC_ASSERT(nofl_allocator_has_block(alloc));
   struct nofl_block_ref block = alloc->block;
   GC_ASSERT(alloc->alloc == alloc->sweep);
-  atomic_fetch_add(&space->allocated_granules_since_last_collection,
-                   block.summary->hole_granules);
-  atomic_fetch_add(&space->survivor_granules_at_last_collection,
-                   NOFL_GRANULES_PER_BLOCK - block.summary->hole_granules);
-  atomic_fetch_add(&space->fragmentation_granules_since_last_collection,
-                   block.summary->fragmentation_granules);
+  gc_atomic_fetch_add(&space->allocated_granules_since_last_collection,
+                      block.summary->hole_granules);
+  gc_atomic_fetch_add(&space->survivor_granules_at_last_collection,
+                      NOFL_GRANULES_PER_BLOCK - block.summary->hole_granules);
+  gc_atomic_fetch_add(&space->fragmentation_granules_since_last_collection,
+                      block.summary->fragmentation_granules);
 
   if (nofl_should_promote_block(space, block))
     nofl_block_list_push(&space->promoted, block);
@@ -645,8 +662,8 @@ nofl_allocator_release_full_evacuation_target(struct nofl_allocator *alloc,
   // FIXME: Check how this affects statistics.
   GC_ASSERT_EQ(block.summary->hole_count, 1);
   GC_ASSERT_EQ(block.summary->hole_granules, NOFL_GRANULES_PER_BLOCK);
-  atomic_fetch_add(&space->old_generation_granules,
-                   NOFL_GRANULES_PER_BLOCK);
+  gc_atomic_fetch_add(&space->old_generation_granules,
+                      NOFL_GRANULES_PER_BLOCK);
   if (hole_size) {
     hole_size >>= NOFL_GRANULE_SIZE_LOG_2;
     block.summary->holes_with_fragmentation = 1;
@@ -724,10 +741,12 @@ nofl_allocator_acquire_evacuation_target(struct nofl_allocator* alloc,
   return nofl_allocator_acquire_empty_block(alloc, space);
 }
 
-static void
-nofl_allocator_finish_hole(struct nofl_allocator *alloc) {
+static inline void
+nofl_allocator_finish_hole(struct nofl_allocator *alloc, int collect_holes) {
   size_t granules = (alloc->sweep - alloc->alloc) / NOFL_GRANULE_SIZE;
   if (granules) {
+    if (collect_holes)
+      nofl_holeset_push_local(&alloc->holes, alloc->alloc, granules);
     alloc->block.summary->holes_with_fragmentation++;
     alloc->block.summary->fragmentation_granules += granules;
     alloc->alloc = alloc->sweep;
@@ -803,9 +822,10 @@ nofl_allocator_next_hole_in_block(struct nofl_allocator *alloc,
 
 static void
 nofl_allocator_finish_sweeping_in_block(struct nofl_allocator *alloc,
-                                        uint8_t survivor_mark) {
+                                        uint8_t survivor_mark,
+                                        int collect_holes) {
   do {
-    nofl_allocator_finish_hole(alloc);
+    nofl_allocator_finish_hole(alloc, collect_holes);
   } while (nofl_allocator_next_hole_in_block(alloc, survivor_mark));
 }
 
@@ -820,7 +840,8 @@ nofl_allocator_release_block(struct nofl_allocator *alloc,
   } else if (space->evacuating) {
     nofl_allocator_release_full_evacuation_target(alloc, space);
   } else {
-    nofl_allocator_finish_sweeping_in_block(alloc, space->survivor_mark);
+    nofl_allocator_finish_sweeping_in_block(alloc, space->survivor_mark,
+                                            !space->evacuating);
     nofl_allocator_release_full_block(alloc, space);
   }
 }
@@ -829,6 +850,7 @@ static void
 nofl_allocator_finish(struct nofl_allocator *alloc, struct nofl_space *space) {
   if (nofl_allocator_has_block(alloc))
     nofl_allocator_release_block(alloc, space);
+  nofl_holeset_release(&alloc->holes, &space->holes, &space->lock);
 }
 
 static int
@@ -850,7 +872,7 @@ nofl_allocator_next_hole_in_block_of_size(struct nofl_allocator *alloc,
     return 0;
 
   while (1) {
-    nofl_allocator_finish_hole(alloc);
+    nofl_allocator_finish_hole(alloc, min_granules && !space->evacuating);
     size_t granules =
       nofl_allocator_next_hole_in_block(alloc, space->survivor_mark);
     if (granules == 0) {
@@ -912,6 +934,7 @@ nofl_allocator_next_hole(struct nofl_allocator *alloc,
         break;
       if (min_granules <= granules)
         return granules;
+      nofl_allocator_finish_hole(alloc, !space->evacuating);
       nofl_allocator_release_full_block(alloc, space);
     }
 
@@ -925,6 +948,51 @@ nofl_allocator_next_hole(struct nofl_allocator *alloc,
   }
 }
 
+static inline struct gc_ref
+nofl_allocate_bump_pointer(struct nofl_allocator *alloc, size_t size,
+                           enum gc_allocation_kind kind) {
+  GC_ASSERT(size <= alloc->sweep - alloc->alloc);
+  struct gc_ref ret = gc_ref(alloc->alloc);
+  alloc->alloc += size;
+  gc_update_alloc_table(ret, size, kind);
+  return ret;
+}
+
+static struct gc_ref
+nofl_allocate_second_chance(struct nofl_allocator *alloc,
+                            struct nofl_space *space, size_t granules) {
+  struct gc_ref local = nofl_holeset_try_pop(&alloc->holes, granules);
+  if (!gc_ref_is_null(local))
+    return local;
+  if (nofl_holeset_acquire(&alloc->holes, &space->holes, &space->lock,
+                           granules))
+    return nofl_holeset_try_pop(&alloc->holes, granules);
+  return gc_ref_null();
+}
+
+static struct gc_ref
+nofl_allocate_slow(struct nofl_allocator *alloc, struct nofl_space *space,
+                   size_t size, enum gc_allocation_kind kind) {
+  size_t granules = size >> NOFL_GRANULE_SIZE_LOG_2;
+
+  if (nofl_allocator_next_hole_in_block_of_size(alloc, space, granules))
+    return nofl_allocate_bump_pointer(alloc, size, kind);
+
+  struct gc_ref second_chance =
+    nofl_allocate_second_chance(alloc, space, granules);
+  if (!gc_ref_is_null(second_chance)) {
+    gc_update_alloc_table(second_chance, size, kind);
+    gc_atomic_fetch_add(&space->second_chance_granules_since_last_collection,
+                        granules);
+    return second_chance;
+  }
+
+  if (nofl_allocator_next_hole(alloc, space, granules))
+    return nofl_allocate_bump_pointer(alloc, size, kind);
+
+  return gc_ref_null();
+}
+
 static struct gc_ref
 nofl_allocate(struct nofl_allocator *alloc, struct nofl_space *space,
               size_t size, enum gc_allocation_kind kind) {
@@ -932,16 +1000,10 @@ nofl_allocate(struct nofl_allocator *alloc, struct nofl_space *space,
   GC_ASSERT(size <= gc_allocator_large_threshold());
   size = align_up(size, NOFL_GRANULE_SIZE);
 
-  if (alloc->alloc + size > alloc->sweep) {
-    size_t granules = size >> NOFL_GRANULE_SIZE_LOG_2;
-    if (!nofl_allocator_next_hole(alloc, space, granules))
-      return gc_ref_null();
-  }
+  if (alloc->alloc + size <= alloc->sweep)
+    return nofl_allocate_bump_pointer(alloc, size, kind);
 
-  struct gc_ref ret = gc_ref(alloc->alloc);
-  alloc->alloc += size;
-  gc_update_alloc_table(ret, size, kind);
-  return ret;
+  return nofl_allocate_slow(alloc, space, size, kind);
 }
 
 static struct gc_ref
@@ -971,27 +1033,84 @@ nofl_finish_sweeping(struct nofl_allocator *alloc,
   while (nofl_allocator_next_hole(alloc, space, 0)) {}
 }
 
-static inline int
-nofl_is_ephemeron(struct gc_ref ref) {
-  uint8_t meta = *nofl_metadata_byte_for_object(ref);
-  uint8_t kind = meta & NOFL_METADATA_BYTE_TRACE_KIND_MASK;
-  return kind == NOFL_METADATA_BYTE_TRACE_EPHEMERON;
-}
-
-static void
-nofl_space_set_ephemeron_flag(struct gc_ref ref) {
-  if (gc_has_conservative_intraheap_edges()) {
-    uint8_t *metadata = nofl_metadata_byte_for_object(ref);
-    uint8_t byte = *metadata & ~NOFL_METADATA_BYTE_TRACE_KIND_MASK;
-    *metadata = byte | NOFL_METADATA_BYTE_TRACE_EPHEMERON;
-  }
-}
-
 struct gc_trace_worker;
 
 static inline int
+nofl_space_heap_has_ambiguous_edges(struct nofl_space *space) {
+  return gc_atomic_load_relaxed(&space->heap_has_ambiguous_edges);
+}
+
+static void
+nofl_clear_pinned_bits_in_block(struct nofl_block_ref block) {
+  uint8_t *meta = nofl_metadata_byte_for_addr(block.addr);
+  uint64_t mask = broadcast_byte (NOFL_METADATA_BYTE_PINNED);
+  for (size_t i = 0; i < NOFL_GRANULES_PER_BLOCK; i += 8, meta += 8) {
+    uint64_t vals = load_eight_aligned_bytes(meta);
+    if (vals & mask)
+      store_eight_aligned_bytes(meta, vals & ~mask);
+  }
+}
+
+static void
+nofl_space_clear_all_pinned_bits(struct nofl_space *space) GC_NEVER_INLINE;
+static void
+nofl_space_clear_all_pinned_bits(struct nofl_space *space) {
+  // FIXME: This is racy in three ways:
+  // (1) with regards to other threads acquiring sweepable blocks
+  // (2) with regards to other threads allocating in their own blocks
+  // (3) with regards to other threads pinning objects anywhere
+  struct gc_lock lock = nofl_space_lock(space);
+
+  for (struct nofl_block_ref walk = nofl_block_head(&space->to_sweep);
+       !nofl_block_is_null(walk);
+       walk = nofl_block_next(walk))
+    nofl_clear_pinned_bits_in_block(walk);
+
+  // not racy here though because of the lock
+  for (struct nofl_block_ref walk = nofl_block_head(&space->partly_full.list);
+       !nofl_block_is_null (walk);
+       walk = nofl_block_next (walk))
+    nofl_clear_pinned_bits_in_block(walk);
+
+  for (struct nofl_block_ref walk = nofl_block_head(&space->full);
+       !nofl_block_is_null(walk);
+       walk = nofl_block_next(walk))
+    nofl_clear_pinned_bits_in_block(walk);
+
+  for (struct nofl_block_ref walk = nofl_block_head(&space->promoted);
+       !nofl_block_is_null(walk);
+       walk = nofl_block_next(walk))
+    nofl_clear_pinned_bits_in_block(walk);
+
+  for (struct nofl_block_ref walk = nofl_block_head(&space->old);
+       !nofl_block_is_null(walk);
+       walk = nofl_block_next(walk))
+    nofl_clear_pinned_bits_in_block(walk);
+
+  gc_lock_release(&lock);
+}
+
+static inline void
+nofl_space_set_heap_has_ambiguous_edges (struct nofl_space *space)
+{
+  if (!nofl_space_heap_has_ambiguous_edges (space)) {
+    fprintf (stderr,
+             "warning: conservatively-traced allocation disables compaction\n");
+    gc_atomic_store_relaxed(&space->heap_has_ambiguous_edges, 1);
+
+    // FIXME: We need to repurpose the pinned bit to indicate objects that
+    // should be traced conservatively, but we don't want to reinterpret
+    // previously pinned but precisely-traced objects as being
+    // conservatively-traced.  Ideally we would have another bit here.  For now,
+    // race to clear all pinned bits.
+    nofl_space_clear_all_pinned_bits (space);
+    space->evacuation_minimum_reserve = space->evacuation_reserve = 0.0;
+  }
+}
+
+static inline int
 nofl_space_contains_address(struct nofl_space *space, uintptr_t addr) {
-  return extents_contain_addr(space->extents, addr);
+  return extents_contain_addr(space->extents, addr) != 0;
 }
 
 static inline int
@@ -1013,7 +1132,7 @@ nofl_space_contains_edge(struct nofl_space *space, struct gc_edge edge) {
 static inline int
 nofl_space_is_survivor(struct nofl_space *space, struct gc_ref ref) {
   uint8_t *metadata = nofl_metadata_byte_for_object(ref);
-  uint8_t byte = atomic_load_explicit(metadata, memory_order_relaxed);
+  uint8_t byte = gc_atomic_load_relaxed(metadata);
   return nofl_metadata_byte_has_mark(byte, space->survivor_mark);
 }
 
@@ -1038,12 +1157,10 @@ nofl_space_remember_edge(struct nofl_space *space, struct gc_ref obj,
     return 0;
   uint8_t* loc = nofl_field_logged_byte(edge);
   uint8_t bit = nofl_field_logged_bit(edge);
-  uint8_t byte = atomic_load_explicit(loc, memory_order_acquire);
+  uint8_t byte = gc_atomic_load(loc);
   do {
     if (byte & bit) return 0;
-  } while (!atomic_compare_exchange_weak_explicit(loc, &byte, byte|bit,
-                                                  memory_order_acq_rel,
-                                                  memory_order_acquire));
+  } while (!gc_atomic_cmpxchg_weak(loc, &byte, byte|bit));
   return 1;
 }
 
@@ -1060,9 +1177,9 @@ nofl_space_forget_edge(struct nofl_space *space, struct gc_edge edge) {
     pthread_mutex_unlock(&space->lock);
   } else {
     // In release mode, race to clear both bits at once.
-    uint8_t byte = atomic_load_explicit(loc, memory_order_relaxed);
+    uint8_t byte = gc_atomic_load_relaxed(loc);
     byte &= ~(NOFL_METADATA_BYTE_LOGGED_0 | NOFL_METADATA_BYTE_LOGGED_1);
-    atomic_store_explicit(loc, byte, memory_order_relaxed);
+    gc_atomic_store_relaxed(loc, byte);
   }
 }
 
@@ -1071,6 +1188,7 @@ nofl_space_reset_statistics(struct nofl_space *space) {
   space->survivor_granules_at_last_collection = 0;
   space->allocated_granules_since_last_collection = 0;
   space->fragmentation_granules_since_last_collection = 0;
+  space->second_chance_granules_since_last_collection = 0;
 }
 
 static size_t
@@ -1083,9 +1201,12 @@ nofl_space_live_size_at_last_collection(struct nofl_space *space) {
 static void
 nofl_space_add_to_allocation_counter(struct nofl_space *space,
                                      uint64_t *counter) {
-  *counter +=
-    atomic_load_explicit(&space->allocated_granules_since_last_collection,
-                         memory_order_relaxed) * NOFL_GRANULE_SIZE;
+  uint64_t allocated =
+    gc_atomic_load_relaxed(&space->allocated_granules_since_last_collection);
+  uint64_t second_chance =
+    gc_atomic_load_relaxed(&space->second_chance_granules_since_last_collection);
+
+  *counter += (allocated + second_chance) * NOFL_GRANULE_SIZE;
 }
   
 static size_t
@@ -1109,8 +1230,7 @@ nofl_space_estimate_live_bytes_after_gc(struct nofl_space *space,
 
   // Assume that if we have pending unavailable bytes after GC that there is a
   // large object waiting to be allocated, so it is practically in the live set.
-  ssize_t pending = atomic_load_explicit(&space->pending_unavailable_bytes,
-                                         memory_order_acquire);
+  ssize_t pending = gc_atomic_load(&space->pending_unavailable_bytes);
   if (pending > 0)
     bytes += pending;
   DEBUG("--- nofl estimate after adjustment: %zu\n", bytes);
@@ -1120,7 +1240,19 @@ nofl_space_estimate_live_bytes_after_gc(struct nofl_space *space,
 
 static size_t
 nofl_space_evacuation_reserve_bytes(struct nofl_space *space) {
-  return nofl_block_count(&space->evacuation_targets) * NOFL_BLOCK_SIZE;
+  return nofl_evacuation_block_count(space) * NOFL_BLOCK_SIZE;
+}
+
+static size_t
+nofl_space_evacuation_minimum_reserve_bytes(struct nofl_space *space) {
+  return
+    ceil(space->evacuation_minimum_reserve * nofl_active_block_count(space))
+    * NOFL_BLOCK_SIZE;
+}
+
+static size_t
+nofl_space_size(struct nofl_space *space) {
+  return nofl_active_block_count(space) * NOFL_BLOCK_SIZE;
 }
 
 static size_t
@@ -1258,8 +1390,8 @@ nofl_space_finish_evacuation(struct nofl_space *space,
   GC_ASSERT(space->evacuating);
   space->evacuating = 0;
   size_t active = nofl_active_block_count(space);
-  size_t reserve = space->evacuation_minimum_reserve * active;
-  GC_ASSERT(nofl_block_count(&space->evacuation_targets) == 0);
+  size_t reserve = ceil(space->evacuation_minimum_reserve * active);
+  GC_ASSERT(nofl_evacuation_block_count(space) == 0);
   while (reserve--) {
     struct nofl_block_ref block = nofl_pop_empty_block_with_lock(space, lock);
     if (nofl_block_is_null(block)) break;
@@ -1276,9 +1408,9 @@ nofl_space_promote_blocks(struct nofl_space *space) {
     block.summary->holes_with_fragmentation = 0;
     block.summary->fragmentation_granules = 0;
     struct nofl_allocator alloc = { block.addr, block.addr, block };
-    nofl_allocator_finish_sweeping_in_block(&alloc, space->current_mark);
-    atomic_fetch_add(&space->old_generation_granules,
-                     NOFL_GRANULES_PER_BLOCK - block.summary->hole_granules);
+    nofl_allocator_finish_sweeping_in_block(&alloc, space->current_mark, 0);
+    gc_atomic_fetch_add(&space->old_generation_granules,
+                        NOFL_GRANULES_PER_BLOCK - block.summary->hole_granules);
     nofl_block_list_push(&space->old, block);
   }
 }
@@ -1288,14 +1420,44 @@ nofl_size_to_granules(size_t size) {
   return (size + NOFL_GRANULE_SIZE - 1) >> NOFL_GRANULE_SIZE_LOG_2;
 }
 
+static inline enum gc_trace_kind
+nofl_metadata_byte_trace_kind(struct nofl_space *space, uint8_t byte)
+{
+  uint8_t mask = NOFL_METADATA_BYTE_TRACE_KIND_MASK;
+  if (!nofl_space_heap_has_ambiguous_edges (space))
+    mask &= ~NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY;
+
+  switch (byte & mask) {
+  case NOFL_METADATA_BYTE_TRACE_PRECISELY:
+    return GC_TRACE_PRECISELY;
+  case NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY:
+    return GC_TRACE_CONSERVATIVELY;
+  case NOFL_METADATA_BYTE_TRACE_NONE:
+    return GC_TRACE_NONE;
+  default:
+    /* Untagged pointerless objects are allocated with the PINNED bit,
+       because we can't relocate them, because we don't have a tag word
+       to hold the forwarding state.  Fortunately, this bit pattern is
+       different from NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY; we can
+       just leave it as-is.  */
+    GC_ASSERT_EQ (byte & mask,
+                  NOFL_METADATA_BYTE_TRACE_NONE | NOFL_METADATA_BYTE_PINNED);
+    return GC_TRACE_NONE;
+  }
+}
+
+static void
+nofl_assert_not_forwarded(struct gc_ref ref)
+{
+  uint8_t *metadata = nofl_metadata_byte_for_object(ref);
+  uint8_t byte = gc_atomic_load_relaxed(metadata);
+  GC_ASSERT(!nofl_metadata_byte_has_mark(byte, NOFL_METADATA_BYTE_FORWARDED));
+}
+
 static void
 nofl_space_verify_sweepable_blocks(struct nofl_space *space,
                                    struct nofl_block_list *list)
 {
-  if (GC_CONSERVATIVE_TRACE)
-    // No intrinsic way to measure object size, only the extrinsic
-    // metadata bytes.
-    return;
   for (struct nofl_block_ref b = nofl_block_for_addr(list->blocks);
        !nofl_block_is_null(b);
        b = nofl_block_next(b)) {
@@ -1305,18 +1467,37 @@ nofl_space_verify_sweepable_blocks(struct nofl_space *space,
     uintptr_t limit = addr + NOFL_BLOCK_SIZE;
     uint8_t *meta = nofl_metadata_byte_for_addr(b.addr);
     while (addr < limit) {
-      if (nofl_metadata_byte_has_mark(meta[0], space->current_mark)) {
+      uint8_t byte = meta[0];
+      if (nofl_metadata_byte_has_mark(byte, space->current_mark)) {
         struct gc_ref obj = gc_ref(addr);
-        size_t obj_bytes;
-        gc_trace_object(obj, NULL, NULL, NULL, &obj_bytes);
-        size_t granules = nofl_size_to_granules(obj_bytes);
-        GC_ASSERT(granules);
-        for (size_t granule = 0; granule < granules - 1; granule++)
-          GC_ASSERT(!(meta[granule] & NOFL_METADATA_BYTE_END));
+        size_t granules = 1;
+        while (addr + granules * NOFL_GRANULE_SIZE < limit
+               && !(meta[granules - 1] & NOFL_METADATA_BYTE_END))
+          granules++;
+        GC_ASSERT(meta[granules - 1] & NOFL_METADATA_BYTE_END);
+
+        if (nofl_metadata_byte_trace_kind(space, byte) == GC_TRACE_PRECISELY) {
+          size_t trace_bytes = gc_trace_object(obj, NULL, NULL, NULL);
+          size_t trace_granules = nofl_size_to_granules(trace_bytes);
+          GC_ASSERT_EQ(granules, trace_granules);
+
+          nofl_assert_not_forwarded(obj);
+        }
+
+        meta += granules;
+        addr += granules * NOFL_GRANULE_SIZE;
+      } else if (byte & NOFL_METADATA_BYTE_MARK_MASK) {
+        size_t granules = 1;
+        while (addr + granules * NOFL_GRANULE_SIZE < limit
+               && !(meta[granules - 1] & NOFL_METADATA_BYTE_END)) {
+          granules++;
+          GC_ASSERT_EQ(meta[granules - 1] & NOFL_METADATA_BYTE_MARK_MASK, 0);
+        }
         GC_ASSERT(meta[granules - 1] & NOFL_METADATA_BYTE_END);
         meta += granules;
         addr += granules * NOFL_GRANULE_SIZE;
       } else {
+        GC_ASSERT_EQ(byte & NOFL_METADATA_BYTE_END, 0);
         meta++;
         addr += NOFL_GRANULE_SIZE;
       }
@@ -1328,10 +1509,6 @@ nofl_space_verify_sweepable_blocks(struct nofl_space *space,
 static void
 nofl_space_verify_swept_blocks(struct nofl_space *space,
                                struct nofl_block_list *list) {
-  if (GC_CONSERVATIVE_TRACE)
-    // No intrinsic way to measure object size, only the extrinsic
-    // metadata bytes.
-    return;
   for (struct nofl_block_ref b = nofl_block_for_addr(list->blocks);
        !nofl_block_is_null(b);
        b = nofl_block_next(b)) {
@@ -1341,16 +1518,24 @@ nofl_space_verify_swept_blocks(struct nofl_space *space,
     uintptr_t limit = addr + NOFL_BLOCK_SIZE;
     uint8_t *meta = nofl_metadata_byte_for_addr(addr);
     while (addr < limit) {
-      if (meta[0]) {
-        GC_ASSERT(nofl_metadata_byte_has_mark(meta[0], space->current_mark));
+      uint8_t byte = meta[0];
+      if (byte) {
+        GC_ASSERT(nofl_metadata_byte_has_mark(byte, space->current_mark));
         struct gc_ref obj = gc_ref(addr);
-        size_t obj_bytes;
-        gc_trace_object(obj, NULL, NULL, NULL, &obj_bytes);
-        size_t granules = nofl_size_to_granules(obj_bytes);
-        GC_ASSERT(granules);
-        for (size_t granule = 0; granule < granules - 1; granule++)
-          GC_ASSERT(!(meta[granule] & NOFL_METADATA_BYTE_END));
+        size_t granules = 1;
+        while (addr + granules * NOFL_GRANULE_SIZE < limit
+               && !(meta[granules - 1] & NOFL_METADATA_BYTE_END))
+          granules++;
         GC_ASSERT(meta[granules - 1] & NOFL_METADATA_BYTE_END);
+
+        if (nofl_metadata_byte_trace_kind(space, byte) == GC_TRACE_PRECISELY) {
+          size_t trace_bytes = gc_trace_object(obj, NULL, NULL, NULL);
+          size_t trace_granules = nofl_size_to_granules(trace_bytes);
+          GC_ASSERT_EQ(granules, trace_granules);
+
+          nofl_assert_not_forwarded(obj);
+        }
+
         meta += granules;
         addr += granules * NOFL_GRANULE_SIZE;
       } else {
@@ -1397,6 +1582,7 @@ nofl_space_verify_before_restart(struct nofl_space *space) {
   nofl_space_verify_swept_blocks(space, &space->full);
   nofl_space_verify_swept_blocks(space, &space->old);
   nofl_space_verify_empty_blocks(space, &space->empty.list, 1);
+  nofl_space_verify_empty_blocks(space, &space->evacuation_targets, 1);
   for (int age = 0; age < NOFL_PAGE_OUT_QUEUE_SIZE; age++)
     nofl_space_verify_empty_blocks(space, &space->paged_out[age].list, 0);
   // GC_ASSERT(space->last_collection_was_minor || !nofl_block_count(&space->old));
@@ -1405,6 +1591,7 @@ nofl_space_verify_before_restart(struct nofl_space *space) {
 static void
 nofl_space_finish_gc(struct nofl_space *space,
                      enum gc_collection_kind gc_kind) {
+  nofl_holeset_clear(&space->holes);
   space->last_collection_was_minor = (gc_kind == GC_COLLECTION_MINOR);
   struct gc_lock lock = nofl_space_lock(space);
   if (space->evacuating)
@@ -1415,8 +1602,8 @@ nofl_space_finish_gc(struct nofl_space *space,
     // to the evacuation reserve, return those blocks to the empty set
     // for allocation by the mutator.
     size_t active = nofl_active_block_count(space);
-    size_t target = space->evacuation_minimum_reserve * active;
-    size_t reserve = nofl_block_count(&space->evacuation_targets);
+    size_t target = ceil(space->evacuation_minimum_reserve * active);
+    size_t reserve = nofl_evacuation_block_count(space);
     while (reserve-- > target)
       nofl_push_empty_block(space,
                             nofl_block_list_pop(&space->evacuation_targets),
@@ -1437,10 +1624,8 @@ nofl_space_finish_gc(struct nofl_space *space,
           nofl_push_empty_block(space, block, &lock);
       }
     }
-    atomic_store_explicit(&space->to_sweep.count, to_sweep.count,
-                          memory_order_release);
-    atomic_store_explicit(&space->to_sweep.blocks, to_sweep.blocks,
-                          memory_order_release);
+    gc_atomic_store(&space->to_sweep.count, to_sweep.count);
+    gc_atomic_store(&space->to_sweep.blocks, to_sweep.blocks);
   }
 
   // FIXME: Promote concurrently instead of during the pause.
@@ -1454,20 +1639,20 @@ nofl_space_finish_gc(struct nofl_space *space,
 
 static ssize_t
 nofl_space_request_release_memory(struct nofl_space *space, size_t bytes) {
-  return atomic_fetch_add(&space->pending_unavailable_bytes, bytes) + bytes;
+  return gc_atomic_fetch_add(&space->pending_unavailable_bytes, bytes) + bytes;
 }
 
 static ssize_t
 nofl_space_maybe_reacquire_memory(struct nofl_space *space, size_t bytes) {
   ssize_t pending =
-    atomic_fetch_sub(&space->pending_unavailable_bytes, bytes) - bytes;
+    gc_atomic_fetch_sub(&space->pending_unavailable_bytes, bytes) - bytes;
   struct gc_lock lock = nofl_space_lock(space);
   while (pending + NOFL_BLOCK_SIZE <= 0) {
     struct nofl_block_ref block = nofl_pop_unavailable_block(space, &lock);
     if (nofl_block_is_null(block)) break;
     if (!nofl_push_evacuation_target_if_needed(space, block))
       nofl_push_empty_block(space, block, &lock);
-    pending = atomic_fetch_add(&space->pending_unavailable_bytes, NOFL_BLOCK_SIZE)
+    pending = gc_atomic_fetch_add(&space->pending_unavailable_bytes, NOFL_BLOCK_SIZE)
       + NOFL_BLOCK_SIZE;
   }
   gc_lock_release(&lock);
@@ -1477,7 +1662,7 @@ nofl_space_maybe_reacquire_memory(struct nofl_space *space, size_t bytes) {
 static inline int
 nofl_space_should_evacuate(struct nofl_space *space, uint8_t metadata_byte,
                            struct gc_ref obj) {
-  if (gc_has_conservative_intraheap_edges())
+  if (nofl_space_heap_has_ambiguous_edges (space))
     return 0;
   if (!space->evacuating)
     return 0;
@@ -1488,49 +1673,41 @@ nofl_space_should_evacuate(struct nofl_space *space, uint8_t metadata_byte,
 }
 
 static inline int
-nofl_space_set_mark_relaxed(struct nofl_space *space, uint8_t *metadata,
-                            uint8_t byte) {
+nofl_space_set_mark(struct nofl_space *space, uint8_t *metadata,
+                    uint8_t byte) {
   uint8_t mask = NOFL_METADATA_BYTE_MARK_MASK;
-  atomic_store_explicit(metadata,
-                        (byte & ~mask) | space->current_mark,
-                        memory_order_relaxed);
-  return 1;
-}
-
-static inline int
-nofl_space_set_mark(struct nofl_space *space, uint8_t *metadata, uint8_t byte) {
-  uint8_t mask = NOFL_METADATA_BYTE_MARK_MASK;
-  atomic_store_explicit(metadata,
-                        (byte & ~mask) | space->current_mark,
-                        memory_order_release);
-  return 1;
+  byte = (byte & ~mask) | space->current_mark;
+  uint8_t prev = gc_atomic_swap_relaxed(metadata, byte);
+  return byte != prev;
 }
 
 static inline int
 nofl_space_set_nonempty_mark(struct nofl_space *space, uint8_t *metadata,
                              uint8_t byte, struct gc_ref ref) {
   // FIXME: Check that relaxed atomics are actually worth it.
-  nofl_space_set_mark_relaxed(space, metadata, byte);
-  nofl_block_set_mark(gc_ref_value(ref));
-  return 1;
+  if (nofl_space_set_mark(space, metadata, byte)) {
+    GC_ASSERT(nofl_metadata_byte_is_young_or_has_mark(byte,
+                                                      space->survivor_mark));
+    nofl_block_set_mark(gc_ref_value(ref));
+    return 1;
+  }
+  return 0;
 }
 
 static inline void
 nofl_space_pin_object(struct nofl_space *space, struct gc_ref ref) {
   // For the heap-conservative configuration, all objects are pinned, and we use
-  // the pinned bit instead to identify an object's trace kind.
-  if (gc_has_conservative_intraheap_edges())
+  // the pinned bit instead to indicate conservatively-traced objects.
+  if (nofl_space_heap_has_ambiguous_edges (space))
     return;
   uint8_t *metadata = nofl_metadata_byte_for_object(ref);
-  uint8_t byte = atomic_load_explicit(metadata, memory_order_relaxed);
+  uint8_t byte = gc_atomic_load_relaxed(metadata);
   if (byte & NOFL_METADATA_BYTE_PINNED)
     return;
   uint8_t new_byte;
   do {
     new_byte = byte | NOFL_METADATA_BYTE_PINNED;
-  } while (!atomic_compare_exchange_weak_explicit(metadata, &byte, new_byte,
-                                                  memory_order_acq_rel,
-                                                  memory_order_acquire));
+  } while (!gc_atomic_cmpxchg_weak(metadata, &byte, new_byte));
 }
 
 static inline uint8_t
@@ -1560,84 +1737,71 @@ clear_logged_bits_in_evacuated_object(uint8_t head, uint8_t *metadata,
   return head & ~mask;
 }
 
+
 static inline int
 nofl_space_evacuate(struct nofl_space *space, uint8_t *metadata, uint8_t byte,
                     struct gc_edge edge,
                     struct gc_ref old_ref,
                     struct nofl_allocator *evacuate) {
-  struct gc_atomic_forward fwd = gc_atomic_forward_begin(old_ref);
+  uint8_t mark = byte & NOFL_METADATA_BYTE_MARK_MASK;
+  uint8_t busy_byte = (byte - mark) | NOFL_METADATA_BYTE_BUSY;
+  uint8_t forwarded_byte = (byte - mark) | NOFL_METADATA_BYTE_FORWARDED;
+  uint8_t marked_byte = (byte - mark) | space->current_mark;
 
-  if (fwd.state == GC_FORWARDING_STATE_NOT_FORWARDED)
-    gc_atomic_forward_acquire(&fwd);
+  int claimed =
+    nofl_metadata_byte_is_young_or_has_mark(byte, space->survivor_mark)
+    && gc_atomic_cmpxchg_strong(metadata, &byte, busy_byte);
 
-  switch (fwd.state) {
-  case GC_FORWARDING_STATE_NOT_FORWARDED:
-  default:
-    // Impossible.
-    GC_CRASH();
-  case GC_FORWARDING_STATE_ACQUIRED: {
-    // We claimed the object successfully.
-
-    // First check again if someone else tried to evacuate this object and ended
-    // up marking in place instead.
-    byte = atomic_load_explicit(metadata, memory_order_acquire);
-    if (nofl_metadata_byte_has_mark(byte, space->current_mark)) {
-      // Indeed, already marked in place.
-      gc_atomic_forward_abort(&fwd);
-      return 0;
-    }
-
-    // Otherwise, we try to evacuate.
+  if (claimed) {
+    // It's up to us to shade the object.
     size_t object_granules = nofl_space_live_object_granules(metadata);
     struct gc_ref new_ref = nofl_evacuation_allocate(evacuate, space,
                                                      object_granules);
-    if (!gc_ref_is_null(new_ref)) {
+    if (gc_ref_is_null(new_ref)) {
+      // Well shucks; allocation failed.  Mark in place and then release the
+      // object.
+      gc_atomic_store(metadata, marked_byte);
+      nofl_block_set_mark(gc_ref_value(old_ref));
+    } else {
       // Whee, it works!  Copy object contents before committing, as we don't
       // know what part of the object (if any) will be overwritten by the
       // commit.
       memcpy(gc_ref_heap_object(new_ref), gc_ref_heap_object(old_ref),
              object_granules * NOFL_GRANULE_SIZE);
-      gc_atomic_forward_commit(&fwd, new_ref);
+      gc_object_forward_nonatomic(old_ref, new_ref);
+      gc_atomic_store(metadata, forwarded_byte);
+
       // Now update extent metadata, and indicate to the caller that
       // the object's fields need to be traced.
       uint8_t *new_metadata = nofl_metadata_byte_for_addr(gc_ref_value(new_ref));
       memcpy(new_metadata + 1, metadata + 1, object_granules - 1);
+      byte = marked_byte;
       if (GC_GENERATIONAL)
         byte = clear_logged_bits_in_evacuated_object(byte, new_metadata,
                                                      object_granules);
+      *new_metadata = byte;
+      nofl_block_set_mark(gc_ref_value(new_ref));
       gc_edge_update(edge, new_ref);
-      return nofl_space_set_nonempty_mark(space, new_metadata, byte,
-                                          new_ref);
-    } else {
-      // Well shucks; allocation failed.  Mark in place and then release the
-      // object.
-      nofl_space_set_mark(space, metadata, byte);
-      nofl_block_set_mark(gc_ref_value(old_ref));
-      gc_atomic_forward_abort(&fwd);
-      return 1;
     }
-    break;
+    // Either way, since we claimed the object, we shaded it grey.
+    return 1;
   }
-  case GC_FORWARDING_STATE_BUSY:
-    // Someone else claimed this object first.  Spin until new address
-    // known, or evacuation aborts.
-    for (size_t spin_count = 0;; spin_count++) {
-      if (gc_atomic_forward_retry_busy(&fwd))
-        break;
-      yield_for_spin(spin_count);
-    }
-    if (fwd.state == GC_FORWARDING_STATE_NOT_FORWARDED)
-      // Remove evacuation aborted; remote will mark and enqueue.
-      return 0;
-    ASSERT(fwd.state == GC_FORWARDING_STATE_FORWARDED);
-    // Fall through.
-  case GC_FORWARDING_STATE_FORWARDED:
-    // The object has been evacuated already.  Update the edge;
-    // whoever forwarded the object will make sure it's eventually
-    // traced.
-    gc_edge_update(edge, gc_ref(gc_atomic_forward_address(&fwd)));
-    return 0;
+
+  // If we failed to claim the object, someone else shaded it grey (or
+  // is in the process of doing so).  Wait for that to complete, if
+  // needed, then update our edge if the object was forwarded.
+  for (size_t spin_count = 0; byte == busy_byte; spin_count++) {
+    yield_for_spin(spin_count);
+    byte = gc_atomic_load(metadata);
   }
+
+  if (byte == forwarded_byte) {
+    struct gc_ref new_ref = gc_ref(gc_object_forwarded_nonatomic(old_ref));
+    GC_ASSERT(!gc_ref_is_null(new_ref));
+    gc_edge_update(edge, new_ref);
+  }
+
+  return 0;
 }
 
 static inline int
@@ -1646,7 +1810,7 @@ nofl_space_evacuate_or_mark_object(struct nofl_space *space,
                                    struct gc_ref old_ref,
                                    struct nofl_allocator *evacuate) {
   uint8_t *metadata = nofl_metadata_byte_for_object(old_ref);
-  uint8_t byte = *metadata;
+  uint8_t byte = gc_atomic_load(metadata);
   if (nofl_metadata_byte_has_mark(byte, space->current_mark))
     return 0;
 
@@ -1661,7 +1825,7 @@ static inline int
 nofl_space_mark_object(struct nofl_space *space, struct gc_ref ref,
                        struct nofl_allocator *evacuate) {
   uint8_t *metadata = nofl_metadata_byte_for_object(ref);
-  uint8_t byte = *metadata;
+  uint8_t byte = gc_atomic_load(metadata);
   if (nofl_metadata_byte_has_mark(byte, space->current_mark))
     return 0;
 
@@ -1670,48 +1834,27 @@ nofl_space_mark_object(struct nofl_space *space, struct gc_ref ref,
   return nofl_space_set_nonempty_mark(space, metadata, byte, ref);
 }
 
-static inline int
-nofl_space_forward_if_evacuated(struct nofl_space *space,
-                                struct gc_edge edge,
-                                struct gc_ref ref) {
-  struct gc_atomic_forward fwd = gc_atomic_forward_begin(ref);
-  switch (fwd.state) {
-  case GC_FORWARDING_STATE_NOT_FORWARDED:
-    return 0;
-  case GC_FORWARDING_STATE_BUSY:
-    // Someone else claimed this object first.  Spin until new address
-    // known, or evacuation aborts.
-    for (size_t spin_count = 0;; spin_count++) {
-      if (gc_atomic_forward_retry_busy(&fwd))
-        break;
-      yield_for_spin(spin_count);
-    }
-    if (fwd.state == GC_FORWARDING_STATE_NOT_FORWARDED)
-      // Remote evacuation aborted; remote will mark and enqueue.
-      return 1;
-    ASSERT(fwd.state == GC_FORWARDING_STATE_FORWARDED);
-    // Fall through.
-  case GC_FORWARDING_STATE_FORWARDED:
-    gc_edge_update(edge, gc_ref(gc_atomic_forward_address(&fwd)));
-    return 1;
-  default:
-    GC_CRASH();
-  }
-}
-
 static int
 nofl_space_forward_or_mark_if_traced(struct nofl_space *space,
                                      struct gc_edge edge,
                                      struct gc_ref ref) {
   uint8_t *metadata = nofl_metadata_byte_for_object(ref);
-  uint8_t byte = *metadata;
-  if (nofl_metadata_byte_has_mark(byte, space->current_mark))
+  uint8_t byte = gc_atomic_load(metadata);
+  uint8_t mark = byte & NOFL_METADATA_BYTE_MARK_MASK;
+  uint8_t busy_byte = (byte - mark) | NOFL_METADATA_BYTE_BUSY;
+  uint8_t forwarded_byte = (byte - mark) | NOFL_METADATA_BYTE_FORWARDED;
+
+  for (size_t spin_count = 0; byte == busy_byte; spin_count++) {
+    yield_for_spin(spin_count);
+    byte = gc_atomic_load(metadata);
+  }
+
+  if (byte == forwarded_byte) {
+    gc_edge_update(edge, gc_ref(gc_object_forwarded_nonatomic(ref)));
     return 1;
+  }
 
-  if (!nofl_space_should_evacuate(space, byte, ref))
-    return 0;
-
-  return nofl_space_forward_if_evacuated(space, edge, ref);
+  return nofl_metadata_byte_has_mark(byte, space->current_mark);
 }
 
 struct nofl_resolved_conservative_ref {
@@ -1746,7 +1889,7 @@ nofl_space_resolve_conservative_ref_with_metadata(struct nofl_space *space,
     return not_an_object;
 
   uint8_t *loc = nofl_metadata_byte_for_addr(addr);
-  uint8_t byte = atomic_load_explicit(loc, memory_order_relaxed);
+  uint8_t byte = gc_atomic_load_relaxed(loc);
 
   // Not pointing to the start of an object?  Scan backwards if the ref
   // is possibly interior, otherwise bail.
@@ -1762,7 +1905,7 @@ nofl_space_resolve_conservative_ref_with_metadata(struct nofl_space *space,
     if (!loc)
       return not_an_object;
 
-    byte = atomic_load_explicit(loc, memory_order_relaxed);
+    byte = gc_atomic_load_relaxed(loc);
     GC_ASSERT(byte & mask);
     // Ran into the end of some other allocation?  Not an object, then.
     if (byte & NOFL_METADATA_BYTE_END)
@@ -1804,10 +1947,11 @@ nofl_space_mark_conservative_ref(struct nofl_space *space,
   GC_ASSERT(nofl_metadata_byte_is_young_or_has_mark(resolved.byte,
                                                     space->survivor_mark));
 
-  nofl_space_set_nonempty_mark(space, resolved.metadata, resolved.byte,
-                               gc_ref(resolved.addr));
+  if (nofl_space_set_nonempty_mark(space, resolved.metadata, resolved.byte,
+                                   gc_ref(resolved.addr)))
+    return gc_ref(resolved.addr);
 
-  return gc_ref(resolved.addr);
+  return gc_ref_null();
 }
 
 static inline size_t
@@ -1817,41 +1961,19 @@ nofl_space_object_size(struct nofl_space *space, struct gc_ref ref) {
   return granules * NOFL_GRANULE_SIZE;
 }
 
-static inline enum gc_trace_kind
-nofl_metadata_byte_trace_kind(uint8_t byte)
-{
-  switch (byte & NOFL_METADATA_BYTE_TRACE_KIND_MASK) {
-  case NOFL_METADATA_BYTE_TRACE_PRECISELY:
-    return GC_TRACE_PRECISELY;
-  case NOFL_METADATA_BYTE_TRACE_NONE:
-    return GC_TRACE_NONE;
-#if GC_CONSERVATIVE_TRACE
-  case NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY:
-    return GC_TRACE_CONSERVATIVELY;
-  case NOFL_METADATA_BYTE_TRACE_EPHEMERON:
-    return GC_TRACE_EPHEMERON;
-#endif
-    default:
-      GC_CRASH();
-  }
-}
 static inline struct gc_trace_plan
 nofl_space_object_trace_plan(struct nofl_space *space, struct gc_ref ref) {
   uint8_t *loc = nofl_metadata_byte_for_object(ref);
-  uint8_t byte = atomic_load_explicit(loc, memory_order_relaxed);
-  enum gc_trace_kind kind = nofl_metadata_byte_trace_kind(byte);
+  uint8_t byte = gc_atomic_load_relaxed(loc);
+  enum gc_trace_kind kind = nofl_metadata_byte_trace_kind (space, byte);
   switch (kind) {
     case GC_TRACE_PRECISELY:
     case GC_TRACE_NONE:
       return (struct gc_trace_plan){ kind, };
-#if GC_CONSERVATIVE_TRACE
     case GC_TRACE_CONSERVATIVELY: {
       size_t granules = nofl_space_live_object_granules(loc);
       return (struct gc_trace_plan){ kind, granules * NOFL_GRANULE_SIZE };
     }
-    case GC_TRACE_EPHEMERON:
-      return (struct gc_trace_plan){ kind, };
-#endif
     default:
       GC_CRASH();
   }
@@ -1887,8 +2009,8 @@ nofl_space_shrink(struct nofl_space *space, size_t bytes) {
     if (nofl_block_is_null(block))
       break;
     nofl_push_unavailable_block(space, block, &lock);
-    pending = atomic_fetch_sub(&space->pending_unavailable_bytes,
-                               NOFL_BLOCK_SIZE);
+    pending = gc_atomic_fetch_sub(&space->pending_unavailable_bytes,
+                                  NOFL_BLOCK_SIZE);
     pending -= NOFL_BLOCK_SIZE;
   }
   
@@ -1899,15 +2021,15 @@ nofl_space_shrink(struct nofl_space *space, size_t bytes) {
   // to the heap lock.
   if (pending > 0) {
     size_t active = nofl_active_block_count(space);
-    size_t target = space->evacuation_minimum_reserve * active;
-    ssize_t avail = nofl_block_count(&space->evacuation_targets);
+    size_t target = ceil(space->evacuation_minimum_reserve * active);
+    ssize_t avail = nofl_evacuation_block_count(space);
     while (avail-- > target && pending > 0) {
       struct nofl_block_ref block =
         nofl_block_list_pop(&space->evacuation_targets);
       GC_ASSERT(!nofl_block_is_null(block));
       nofl_push_unavailable_block(space, block, &lock);
-      pending = atomic_fetch_sub(&space->pending_unavailable_bytes,
-                                 NOFL_BLOCK_SIZE);
+      pending = gc_atomic_fetch_sub(&space->pending_unavailable_bytes,
+                                    NOFL_BLOCK_SIZE);
       pending -= NOFL_BLOCK_SIZE;
     }
   }
@@ -1996,6 +2118,7 @@ nofl_space_init(struct nofl_space *space, size_t size, int atomic,
 
   space->current_mark = space->survivor_mark = NOFL_METADATA_BYTE_MARK_0;
   space->extents = extents_allocate(10);
+  space->heap_has_ambiguous_edges = GC_CONSERVATIVE_TRACE;
   nofl_space_add_slabs(space, slabs, nslabs);
   pthread_mutex_init(&space->lock, NULL);
   space->evacuation_minimum_reserve = GC_CONSERVATIVE_TRACE ? 0.0 : 0.02;

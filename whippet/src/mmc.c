@@ -14,6 +14,7 @@
 #include "debug.h"
 #include "field-set.h"
 #include "gc-align.h"
+#include "gc-atomics.h"
 #include "gc-inline.h"
 #include "gc-platform.h"
 #include "gc-stack.h"
@@ -133,7 +134,7 @@ gc_trace_worker_call_with_data(void (*f)(struct gc_tracer *tracer,
                                struct gc_heap *heap,
                                struct gc_trace_worker *worker) {
   struct gc_trace_worker_data data;
-  nofl_allocator_reset(&data.allocator);
+  nofl_allocator_init(&data.allocator);
   f(tracer, heap, worker, &data);
   nofl_allocator_finish(&data.allocator, heap_nofl_space(heap));
 }
@@ -160,8 +161,7 @@ trace_edge(struct gc_heap *heap, struct gc_edge edge,
   int is_new = do_trace(heap, edge, ref, data);
 
   if (is_new &&
-      GC_UNLIKELY(atomic_load_explicit(&heap->check_pending_ephemerons,
-                                       memory_order_relaxed)))
+      GC_UNLIKELY(gc_atomic_load_relaxed(&heap->check_pending_ephemerons)))
     gc_resolve_pending_ephemerons(ref, heap);
 
   return is_new;
@@ -188,8 +188,7 @@ trace_pinned_edge(struct gc_heap *heap, struct gc_ref ref,
   int is_new = do_trace_pinned(heap, ref, data);
 
   if (is_new &&
-      GC_UNLIKELY(atomic_load_explicit(&heap->check_pending_ephemerons,
-                                       memory_order_relaxed)))
+      GC_UNLIKELY(gc_atomic_load_relaxed(&heap->check_pending_ephemerons)))
     gc_resolve_pending_ephemerons(ref, heap);
 
   return is_new;
@@ -216,7 +215,7 @@ gc_visit_ephemeron_key(struct gc_edge edge, struct gc_heap *heap) {
 
 static int
 mutators_are_stopping(struct gc_heap *heap) {
-  return atomic_load_explicit(&heap->collecting, memory_order_relaxed);
+  return gc_atomic_load_relaxed(&heap->collecting);
 }
 
 static inline void
@@ -240,7 +239,7 @@ add_mutator(struct gc_heap *heap, struct gc_mutator *mut) {
   mut->heap = heap;
   mut->event_listener_data =
     heap->event_listener.mutator_added(heap->event_listener_data);
-  nofl_allocator_reset(&mut->allocator);
+  nofl_allocator_init(&mut->allocator);
   gc_field_set_writer_init(&mut->logger, &heap->remembered_set);
   heap_lock(heap);
   // We have no roots.  If there is a GC currently in progress, we have
@@ -267,6 +266,8 @@ remove_mutator(struct gc_heap *heap, struct gc_mutator *mut) {
   MUTATOR_EVENT(mut, mutator_removed);
   mut->heap = NULL;
   heap_lock(heap);
+  if (!mut->active)
+    heap->inactive_mutator_count--;
   heap->mutator_count--;
   mut->active = 0;
   if (mut->next)
@@ -348,8 +349,7 @@ trace_conservative_ref(struct gc_heap *heap, struct gc_conservative_ref ref,
                        int possibly_interior) {
   struct gc_ref ret = do_trace_conservative_ref(heap, ref, possibly_interior);
   if (!gc_ref_is_null(ret)) {
-    if (GC_UNLIKELY(atomic_load_explicit(&heap->check_pending_ephemerons,
-                                         memory_order_relaxed)))
+    if (GC_UNLIKELY(gc_atomic_load_relaxed(&heap->check_pending_ephemerons)))
       gc_resolve_pending_ephemerons(ret, heap);
   }
 
@@ -423,7 +423,7 @@ trace_one(struct gc_ref ref, struct gc_heap *heap,
   struct gc_trace_plan plan = trace_plan(heap, ref);
   switch (plan.kind) {
     case GC_TRACE_PRECISELY:
-      gc_trace_object(ref, tracer_visit, heap, worker, NULL);
+      gc_trace_object(ref, tracer_visit, heap, worker);
       break;
     case GC_TRACE_NONE:
       break;
@@ -435,10 +435,6 @@ trace_one(struct gc_ref ref, struct gc_heap *heap,
                                heap, worker);
       break;
     }
-    case GC_TRACE_EPHEMERON:
-      gc_trace_ephemeron(gc_ref_heap_object(ref), tracer_visit, heap,
-                         worker);
-      break;
     default:
       GC_CRASH();
   }
@@ -474,12 +470,14 @@ trace_root(struct gc_root root, struct gc_heap *heap,
                                    trace_remembered_edge, heap, worker);
     break;
   case GC_ROOT_KIND_HEAP_PINNED_ROOTS:
+    GC_ASSERT(!heap_nofl_space(heap)->evacuating);
     gc_trace_heap_pinned_roots(root.heap->roots,
                                tracer_visit_pinned_root,
                                trace_conservative_edges_wrapper,
                                heap, worker);
     break;
   case GC_ROOT_KIND_MUTATOR_PINNED_ROOTS:
+    GC_ASSERT(!heap_nofl_space(heap)->evacuating);
     gc_trace_mutator_pinned_roots(root.mutator->roots,
                                   tracer_visit_pinned_root,
                                   trace_conservative_edges_wrapper,
@@ -493,7 +491,7 @@ trace_root(struct gc_root root, struct gc_heap *heap,
 static void
 request_mutators_to_stop(struct gc_heap *heap) {
   GC_ASSERT(!mutators_are_stopping(heap));
-  atomic_store_explicit(&heap->collecting, 1, memory_order_relaxed);
+  gc_atomic_store_relaxed(&heap->collecting, 1);
 }
 
 static void
@@ -501,7 +499,7 @@ allow_mutators_to_continue(struct gc_heap *heap) {
   GC_ASSERT(mutators_are_stopping(heap));
   GC_ASSERT(all_mutators_stopped(heap));
   heap->paused_mutator_count--;
-  atomic_store_explicit(&heap->collecting, 0, memory_order_relaxed);
+  gc_atomic_store_relaxed(&heap->collecting, 0);
   GC_ASSERT(!mutators_are_stopping(heap));
   pthread_cond_broadcast(&heap->mutator_cond);
 }
@@ -581,11 +579,14 @@ heap_last_gc_yield(struct gc_heap *heap) {
   return 1.0 - ((double) live_size) / heap->size_at_last_gc;
 }
 
+// Just return fragmentation in the nofl space, it's the only thing that
+// matters for deciding whether or not to decide to compact the nofl
+// space.
 static double
 heap_fragmentation(struct gc_heap *heap) {
   struct nofl_space *nofl_space = heap_nofl_space(heap);
   size_t fragmentation = nofl_space_fragmentation(nofl_space);
-  return ((double)fragmentation) / heap->size;
+  return ((double)fragmentation) / nofl_space_size(nofl_space);
 }
 
 static size_t
@@ -621,10 +622,13 @@ grow_heap_if_necessary(struct gc_heap *heap,
   // If we cannot defragment and are making no progress but have a
   // growable heap, expand by 25% to add some headroom.
   size_t needed_headroom =
-    GC_CONSERVATIVE_TRACE
+    nofl_space_heap_has_ambiguous_edges (nofl)
     ? (progress ? 0 : nofl_active_block_count (nofl) * NOFL_BLOCK_SIZE / 4)
     : 0;
   size_t headroom = nofl_empty_block_count(nofl) * NOFL_BLOCK_SIZE;
+
+  headroom += nofl_space_evacuation_reserve_bytes(nofl);
+  needed_headroom += nofl_space_evacuation_minimum_reserve_bytes(nofl);
 
   if (headroom < needed_headroom + pending)
     resize_heap(heap, heap->size - headroom + needed_headroom + pending);
@@ -652,12 +656,11 @@ static enum gc_collection_kind
 determine_collection_kind(struct gc_heap *heap,
                           enum gc_collection_kind requested) {
   struct nofl_space *nofl_space = heap_nofl_space(heap);
-  enum gc_collection_kind previous_gc_kind = atomic_load(&heap->gc_kind);
+  enum gc_collection_kind previous_gc_kind = gc_atomic_load(&heap->gc_kind);
   enum gc_collection_kind gc_kind;
   double yield = heap_last_gc_yield(heap);
   double fragmentation = heap_fragmentation(heap);
-  ssize_t pending = atomic_load_explicit(&nofl_space->pending_unavailable_bytes,
-                                         memory_order_acquire);
+  ssize_t pending = gc_atomic_load(&nofl_space->pending_unavailable_bytes);
 
   if (heap->count == 0) {
     DEBUG("first collection is always major\n");
@@ -712,7 +715,7 @@ determine_collection_kind(struct gc_heap *heap,
     gc_kind = GC_COLLECTION_MINOR;
   }
 
-  if (gc_has_conservative_intraheap_edges() &&
+  if (nofl_space_heap_has_ambiguous_edges (nofl_space) &&
       gc_kind == GC_COLLECTION_COMPACTING) {
     DEBUG("welp.  conservative heap scanning, no evacuation for you\n");
     gc_kind = GC_COLLECTION_MAJOR;
@@ -730,7 +733,7 @@ determine_collection_kind(struct gc_heap *heap,
           yield * 100., clamped * 100.);
   }
 
-  atomic_store(&heap->gc_kind, gc_kind);
+  gc_atomic_store(&heap->gc_kind, gc_kind);
   return gc_kind;
 }
 
@@ -763,7 +766,7 @@ enqueue_mutator_conservative_roots(struct gc_heap *heap) {
 static int
 enqueue_global_conservative_roots(struct gc_heap *heap) {
   if (gc_has_global_conservative_roots()) {
-    int possibly_interior = 0;
+    int possibly_interior = 1;
     gc_platform_visit_global_conservative_roots
       (enqueue_conservative_roots, heap, &possibly_interior);
     if (heap->roots)
@@ -827,14 +830,12 @@ enqueue_relocatable_roots(struct gc_heap *heap,
 
 static void
 resolve_ephemerons_lazily(struct gc_heap *heap) {
-  atomic_store_explicit(&heap->check_pending_ephemerons, 0,
-                        memory_order_release);
+  gc_atomic_store(&heap->check_pending_ephemerons, 0);
 }
 
 static void
 resolve_ephemerons_eagerly(struct gc_heap *heap) {
-  atomic_store_explicit(&heap->check_pending_ephemerons, 1,
-                        memory_order_release);
+  gc_atomic_store(&heap->check_pending_ephemerons, 1);
   gc_scan_pending_ephemerons(heap->pending_ephemerons, heap, 0, 1);
 }
 
@@ -940,35 +941,35 @@ collect(struct gc_mutator *mut, enum gc_collection_kind requested_kind) {
 }
 
 static int
-maybe_grow_heap (struct gc_heap *heap, size_t for_allocation)
+maybe_grow_heap_instead_of_collecting(struct gc_heap *heap,
+                                      size_t for_allocation)
 {
-  if (!for_allocation)
-    return 0;
-  if (heap->sizer.policy == GC_HEAP_SIZE_FIXED)
-    return 0;
+  // Sometimes when we have exhausted allocatable blocks, we should grow
+  // the heap instead of collecting.
 
-  pthread_mutex_lock(&heap->lock);
-  if (heap->count_at_last_growth == heap->count)
-    {
-      pthread_mutex_unlock(&heap->lock);
-      return 0;
+  int did_grow = 0;
+
+  // Only grow if this GC is triggered in response to allocation.
+  if (for_allocation) {
+    pthread_mutex_lock(&heap->lock);
+    // Only grow instead of collecting once in a cycle.
+    if (heap->count_at_last_growth != heap->count) {
+      double yield_at_last_gc = heap_last_gc_yield (heap);
+      uint64_t live_at_last_gc =
+        heap->size_at_last_gc * (1.0 - yield_at_last_gc);
+      size_t target_size = gc_heap_sizer_target_size(heap->sizer, heap->size,
+                                                     live_at_last_gc);
+      // Only grow if target heap size is greater than current heap size.
+      if (target_size > heap->size) {
+        target_size = align_up(target_size, NOFL_BLOCK_SIZE);
+        resize_heap(heap, target_size);
+        did_grow = 1;
+      }
     }
+    pthread_mutex_unlock(&heap->lock);
+  }
 
-  uint64_t progress = 0;
-  nofl_space_add_to_allocation_counter(heap_nofl_space(heap), &progress);
-  large_object_space_add_to_allocation_counter(heap_large_object_space(heap),
-                                               &progress);
-  double yield_at_last_gc = heap_last_gc_yield (heap);
-  uint64_t expected_progress = heap->size_at_last_gc * yield_at_last_gc;
-  if (progress < expected_progress / 2)
-    {
-      resize_heap(heap, heap->size + expected_progress / 2);
-      pthread_mutex_unlock(&heap->lock);
-      return 1;
-    }
-
-  pthread_mutex_unlock(&heap->lock);
-  return 0;
+  return did_grow;
 }
 
 static int
@@ -977,7 +978,7 @@ trigger_collection(struct gc_mutator *mut,
                    size_t for_allocation) {
   struct gc_heap *heap = mutator_heap(mut);
 
-  if (maybe_grow_heap (heap, for_allocation))
+  if (maybe_grow_heap_instead_of_collecting(heap, for_allocation))
     return 1;
 
   int prev_kind = -1;
@@ -1031,28 +1032,16 @@ void gc_safepoint_signal_reallow(struct gc_mutator *mut) { GC_CRASH(); }
 
 static enum gc_trace_kind
 compute_trace_kind(enum gc_allocation_kind kind) {
-  if (GC_CONSERVATIVE_TRACE) {
-    switch (kind) {
-      case GC_ALLOCATION_TAGGED:
-      case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
-        return GC_TRACE_CONSERVATIVELY;
-      case GC_ALLOCATION_TAGGED_POINTERLESS:
-      case GC_ALLOCATION_UNTAGGED_POINTERLESS:
-        return GC_TRACE_NONE;
-      default:
-        GC_CRASH();
-      };
-  } else {
-    switch (kind) {
-      case GC_ALLOCATION_TAGGED:
-        return GC_TRACE_PRECISELY;
-      case GC_ALLOCATION_TAGGED_POINTERLESS:
-      case GC_ALLOCATION_UNTAGGED_POINTERLESS:
-        return GC_TRACE_NONE;
-      case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
-      default:
-        GC_CRASH();
-    };
+  switch (kind) {
+  case GC_ALLOCATION_TAGGED:
+    return GC_TRACE_PRECISELY;
+  case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
+    return GC_TRACE_CONSERVATIVELY;
+  case GC_ALLOCATION_TAGGED_POINTERLESS:
+  case GC_ALLOCATION_UNTAGGED_POINTERLESS:
+    return GC_TRACE_NONE;
+  default:
+    GC_CRASH();
   }
 }
 
@@ -1072,7 +1061,7 @@ allocate_large(struct gc_mutator *mut, size_t size,
     if (!trigger_collection(mut, GC_COLLECTION_COMPACTING, size))
       return heap->allocation_failure(heap, size);
   }
-  atomic_fetch_add(&heap->large_object_pages, npages);
+  gc_atomic_fetch_add(&heap->large_object_pages, npages);
 
   void *ret = large_object_space_alloc(lospace, npages, kind);
 
@@ -1088,11 +1077,15 @@ void*
 gc_allocate_slow(struct gc_mutator *mut, size_t size,
                  enum gc_allocation_kind kind) {
   GC_ASSERT(size > 0); // allocating 0 bytes would be silly
+  struct gc_heap *heap = mutator_heap(mut);
+
+  if (GC_UNLIKELY (!GC_CONSERVATIVE_TRACE
+                   && kind == GC_ALLOCATION_UNTAGGED_CONSERVATIVE))
+    nofl_space_set_heap_has_ambiguous_edges (heap_nofl_space (heap));
 
   if (size > gc_allocator_large_threshold())
     return allocate_large(mut, size, compute_trace_kind(kind));
 
-  struct gc_heap *heap = mutator_heap(mut);
   while (1) {
     struct gc_ref ret = nofl_allocate(&mut->allocator, heap_nofl_space(heap),
                                       size, kind);
@@ -1164,11 +1157,7 @@ gc_write_barrier_slow(struct gc_mutator *mut, struct gc_ref obj,
   
 struct gc_ephemeron*
 gc_allocate_ephemeron(struct gc_mutator *mut) {
-  struct gc_ref ret =
-    gc_ref_from_heap_object(gc_allocate(mut, gc_ephemeron_size(),
-                                        GC_ALLOCATION_TAGGED));
-  nofl_space_set_ephemeron_flag(ret);
-  return gc_ref_heap_object(ret);
+  return gc_allocate (mut, gc_ephemeron_size(), GC_ALLOCATION_TAGGED);
 }
 
 void
@@ -1367,20 +1356,13 @@ gc_init(const struct gc_options *options, struct gc_stack_addr stack_base,
   GC_ASSERT_EQ(gc_allocator_alloc_table_alignment(), NOFL_SLAB_SIZE);
   GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_TAGGED_POINTERLESS),
                NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_NONE);
-  if (GC_CONSERVATIVE_TRACE) {
-    GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_TAGGED),
-                 NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY);
+  GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_TAGGED),
+               NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_PRECISELY);
+  if (GC_CONSERVATIVE_TRACE)
     GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_UNTAGGED_CONSERVATIVE),
                  NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_CONSERVATIVELY);
-    GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_UNTAGGED_POINTERLESS),
-                 NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_NONE);
-  } else {
-    GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_TAGGED),
-                 NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_PRECISELY);
-    GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_UNTAGGED_POINTERLESS),
-                 NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_NONE |
-                 NOFL_METADATA_BYTE_PINNED);
-  }
+  GC_ASSERT_EQ(gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_UNTAGGED_POINTERLESS),
+               NOFL_METADATA_BYTE_YOUNG | NOFL_METADATA_BYTE_TRACE_NONE | NOFL_METADATA_BYTE_PINNED);
   GC_ASSERT_EQ(gc_allocator_alloc_table_end_pattern(), NOFL_METADATA_BYTE_END);
   if (GC_GENERATIONAL) {
     GC_ASSERT_EQ(gc_write_barrier_field_table_alignment(), NOFL_SLAB_SIZE);

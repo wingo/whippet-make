@@ -7,6 +7,7 @@
 #include "address-hash.h"
 #include "debug.h"
 #include "embedder-api-impl.h"
+#include "gc-atomics.h"
 #include "gc-ephemeron-internal.h"
 
 // # Overview
@@ -171,14 +172,14 @@ ephemeron_list_try_push(struct gc_ephemeron **loc,
                         struct gc_ephemeron **tail,
                         struct gc_ephemeron** (*get_next)(struct gc_ephemeron*)) {
   *get_next(head) = *tail;
-  return atomic_compare_exchange_weak(loc, tail, head);
+  return gc_atomic_cmpxchg_weak(loc, tail, head);
 }
 
 static void
 ephemeron_list_push(struct gc_ephemeron **loc,
                     struct gc_ephemeron *head,
                     struct gc_ephemeron** (*get_next)(struct gc_ephemeron*)) {
-  struct gc_ephemeron *tail = atomic_load_explicit(loc, memory_order_acquire);
+  struct gc_ephemeron *tail = gc_atomic_load(loc);
   while (!ephemeron_list_try_push(loc, head, &tail, get_next))
     ;
 }
@@ -186,12 +187,12 @@ ephemeron_list_push(struct gc_ephemeron **loc,
 static struct gc_ephemeron*
 ephemeron_list_pop(struct gc_ephemeron **loc,
                    struct gc_ephemeron** (*get_next)(struct gc_ephemeron*)) {
-  struct gc_ephemeron *head = atomic_load_explicit(loc, memory_order_acquire);
+  struct gc_ephemeron *head = gc_atomic_load(loc);
   while (head) {
     // Precondition: the result of get_next on an ephemeron is never
     // updated concurrently; OK to load non-atomically.
     struct gc_ephemeron *tail = *get_next(head);
-    if (atomic_compare_exchange_weak(loc, &head, tail))
+    if (gc_atomic_cmpxchg_weak(loc, &head, tail))
       break;
   }
   return head;
@@ -201,7 +202,7 @@ static struct gc_ephemeron*
 ephemeron_list_follow(struct gc_ephemeron **loc,
                       struct gc_ephemeron** (*get_next)(struct gc_ephemeron*),
                       int (*is_live)(struct gc_ephemeron*)) {
-  struct gc_ephemeron *head = atomic_load_explicit(loc, memory_order_acquire);
+  struct gc_ephemeron *head = gc_atomic_load(loc);
   if (!head) return NULL;
 
   while (1) {
@@ -209,13 +210,13 @@ ephemeron_list_follow(struct gc_ephemeron **loc,
 
     // Skip past any dead nodes.
     while (new_head && !is_live(new_head))
-      new_head = atomic_load_explicit(get_next(new_head), memory_order_acquire);
+      new_head = gc_atomic_load(get_next(new_head));
 
     if (// If we didn't have to advance past any dead nodes, no need to
         // update LOC.
         (head == new_head)
         // Otherwise if we succeed in updating LOC, we're done.
-        || atomic_compare_exchange_strong(loc, &head, new_head)
+        || gc_atomic_cmpxchg_strong(loc, &head, new_head)
         // Someone else managed to advance LOC; that's fine too.
         || (head == new_head))
       return new_head;
@@ -267,7 +268,7 @@ static struct gc_ephemeron** ephemeron_chain(struct gc_ephemeron *e) {
   return &e->chain;
 }
 static int ephemeron_is_dead(struct gc_ephemeron *e) {
-  return !atomic_load_explicit(&e->key.value, memory_order_acquire);
+  return !gc_atomic_load(&e->key.value);
 }
 static int ephemeron_is_not_dead(struct gc_ephemeron *e) {
   return !ephemeron_is_dead(e);
@@ -297,17 +298,17 @@ struct gc_ref gc_ephemeron_swap_value_internal(struct gc_ephemeron *e,
 {
   GC_ASSERT(!gc_ref_is_null(ref));
 
-  uintptr_t prev = atomic_load(&e->value.value);
+  uintptr_t prev = gc_atomic_load(&e->value.value);
   do {
     if (!prev)
       break;
-  } while (!atomic_compare_exchange_weak(&e->value.value, &prev, ref.value));
+  } while (!gc_atomic_cmpxchg_weak(&e->value.value, &prev, ref.value));
 
   return gc_ref(prev);
 }
 
 void gc_ephemeron_mark_dead(struct gc_ephemeron *e) {
-  atomic_store_explicit(&e->key.value, 0, memory_order_release);
+  gc_atomic_store(&e->key.value, 0);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -318,7 +319,7 @@ static struct gc_ephemeron** ephemeron_pending(struct gc_ephemeron *e) {
   return &e->pending;
 }
 static uint8_t ephemeron_state(struct gc_ephemeron *e) {
-  return atomic_load_explicit(&e->state, memory_order_acquire);
+  return gc_atomic_load(&e->state);
 }
 static int ephemeron_is_pending(struct gc_ephemeron *e) {
   return ephemeron_state(e) == EPHEMERON_STATE_PENDING;
@@ -350,7 +351,7 @@ static struct gc_ephemeron* pop_resolved(struct gc_ephemeron **loc) {
 ////////////////////////////////////////////////////////////////////////
 
 struct gc_ref gc_ephemeron_key(struct gc_ephemeron *e) {
-  return gc_ref(atomic_load_explicit(&e->key.value, memory_order_acquire));
+  return gc_ref(gc_atomic_load(&e->key.value));
 }
 
 struct gc_ref gc_ephemeron_value(struct gc_ephemeron *e) {
@@ -427,16 +428,15 @@ static void
 add_pending_ephemeron(struct gc_pending_ephemerons *state,
                       struct gc_ephemeron *e) {
   struct gc_ephemeron **bucket = pending_ephemeron_bucket(state, e->key);
-  atomic_store_explicit(&e->state, EPHEMERON_STATE_PENDING,
-                        memory_order_release);
+  gc_atomic_store(&e->state, EPHEMERON_STATE_PENDING);
   push_pending(bucket, e);
 }
 
 static void maybe_resolve_ephemeron(struct gc_pending_ephemerons *state,
                                     struct gc_ephemeron *e) {
   uint8_t expected = EPHEMERON_STATE_PENDING;
-  if (atomic_compare_exchange_strong(&e->state, &expected,
-                                     EPHEMERON_STATE_RESOLVED))
+  if (gc_atomic_cmpxchg_strong(&e->state, &expected,
+                               EPHEMERON_STATE_RESOLVED))
     push_resolved(&state->resolved, e);
 }
 
@@ -464,15 +464,13 @@ void gc_trace_ephemeron(struct gc_ephemeron *e,
   unsigned epoch = gc_heap_ephemeron_trace_epoch(heap);
   uint8_t expected = EPHEMERON_STATE_TRACED;
   // TRACED[_] -> CLAIMED[_].
-  if (!atomic_compare_exchange_strong(&e->state, &expected,
-                                      EPHEMERON_STATE_CLAIMED))
+  if (!gc_atomic_cmpxchg_strong(&e->state, &expected, EPHEMERON_STATE_CLAIMED))
     return;
 
 
   if (e->epoch == epoch) {
     // CLAIMED[epoch] -> TRACED[epoch].
-    atomic_store_explicit(&e->state, EPHEMERON_STATE_TRACED,
-                          memory_order_release);
+    gc_atomic_store(&e->state, EPHEMERON_STATE_TRACED);
     return;
   }
 
@@ -496,8 +494,7 @@ void gc_trace_ephemeron(struct gc_ephemeron *e,
   // deal.
   if (ephemeron_is_dead(e)) {
     // CLAIMED[epoch] -> TRACED[epoch].
-    atomic_store_explicit(&e->state, EPHEMERON_STATE_TRACED,
-                          memory_order_release);
+    gc_atomic_store(&e->state, EPHEMERON_STATE_TRACED);
     return;
   }
     
@@ -505,8 +502,7 @@ void gc_trace_ephemeron(struct gc_ephemeron *e,
   if (gc_visit_ephemeron_key(gc_ephemeron_key_edge(e), heap)) {
     visit(gc_ephemeron_value_edge(e), heap, trace_data);
     // CLAIMED[epoch] -> TRACED[epoch].
-    atomic_store_explicit(&e->state, EPHEMERON_STATE_TRACED,
-                          memory_order_release);
+    gc_atomic_store(&e->state, EPHEMERON_STATE_TRACED);
     return;
   }
 
@@ -548,7 +544,7 @@ gc_scan_pending_ephemerons(struct gc_pending_ephemerons *state,
 struct gc_ephemeron*
 gc_pop_resolved_ephemerons(struct gc_heap *heap) {
   struct gc_pending_ephemerons *state = gc_heap_pending_ephemerons(heap);
-  return atomic_exchange(&state->resolved, NULL);
+  return gc_atomic_swap(&state->resolved, NULL);
 }    
 
 void
@@ -561,8 +557,7 @@ gc_trace_resolved_ephemerons(struct gc_ephemeron *resolved,
   for (; resolved; resolved = resolved->resolved) {
     visit(gc_ephemeron_value_edge(resolved), heap, trace_data);
     // RESOLVED -> TRACED.
-    atomic_store_explicit(&resolved->state, EPHEMERON_STATE_TRACED,
-                          memory_order_release);
+    gc_atomic_store(&resolved->state, EPHEMERON_STATE_TRACED);
   }
 }    
 
@@ -578,11 +573,10 @@ gc_sweep_pending_ephemerons(struct gc_pending_ephemerons *state,
          e;
          e = follow_pending(&e->pending)) {
       // PENDING -> TRACED, but dead.
-      atomic_store_explicit(&e->key.value, 0, memory_order_release);
-      atomic_store_explicit(&e->state, EPHEMERON_STATE_TRACED,
-                            memory_order_release);
+      gc_atomic_store(&e->key.value, 0);
+      gc_atomic_store(&e->state, EPHEMERON_STATE_TRACED);
     }
-    atomic_store_explicit(bucket, NULL, memory_order_release);
+    gc_atomic_store(bucket, NULL);
   }
 }
 

@@ -29,6 +29,7 @@ GC_TRACEPOINT_LIBS = $(GC_LTTNG_LIBS)
 
 GC_V        = $(v_$(V))
 GC_CC       = gcc
+GC_AR       = ar
 GC_CFLAGS   = -Wall -flto -fno-strict-aliasing -fvisibility=hidden -Wno-unused $(GC_BUILD_CFLAGS)
 GC_CPPFLAGS = -I$(GC_BASE)api $(GC_TRACEPOINT_CPPFLAGS) $(GC_BUILD_CPPFLAGS)
 GC_LDFLAGS  = -lpthread -flto=auto $(GC_TRACEPOINT_LIBS)
@@ -55,7 +56,7 @@ $(GC_OBJDIR)gc-finalizer.o: $(GC_BASE)src/gc-finalizer.c
 GC_STEM_bdw   	   = bdw
 GC_CPPFLAGS_bdw    = -DGC_CONSERVATIVE_ROOTS=1 -DGC_CONSERVATIVE_TRACE=1
 GC_IMPL_CFLAGS_bdw = `pkg-config --cflags bdw-gc`
-GC_LIBS_bdw        = `pkg-config --libs bdw-gc`
+GC_LIBS_bdw        = `pkg-config --libs bdw-gc` -lm
 
 GC_STEM_semi       = semi
 GC_CPPFLAGS_semi   = -DGC_PRECISE_ROOTS=1
@@ -111,3 +112,6 @@ $(GC_OBJDIR)gc-impl.o: $(GC_BASE)src/$(call gc_impl,$(GC_COLLECTOR))
 	$(GC_COMPILE) $(GC_IMPL_CFLAGS) $(GC_EMBEDDER_CPPFLAGS) -c $<
 
 GC_OBJS=$(foreach O,gc-platform.o gc-stack.o gc-options.o gc-tracepoint.o gc-ephemeron.o gc-finalizer.o gc-impl.o,$(GC_OBJDIR)$(O))
+
+$(GC_OBJDIR)libwhippet.a: $(GC_OBJS)
+	$(GC_V)$(GC_AR) rcs $@ $^

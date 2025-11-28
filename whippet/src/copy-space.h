@@ -14,6 +14,7 @@
 #include "debug.h"
 #include "extents.h"
 #include "gc-align.h"
+#include "gc-atomics.h"
 #include "gc-attrs.h"
 #include "gc-inline.h"
 #include "gc-lock.h"
@@ -174,22 +175,20 @@ copy_space_lock(struct copy_space *space) {
 static void
 copy_space_block_list_push(struct copy_space_block_list *list,
                            struct copy_space_block *block) {
-  struct copy_space_block *next =
-    atomic_load_explicit(&list->head, memory_order_acquire);
+  struct copy_space_block *next = gc_atomic_load(&list->head);
   do {
     block->next = next;
-  } while (!atomic_compare_exchange_weak(&list->head, &next, block));
+  } while (!gc_atomic_cmpxchg_weak(&list->head, &next, block));
 }
 
 static struct copy_space_block*
 copy_space_block_list_pop(struct copy_space_block_list *list) {
-  struct copy_space_block *head =
-    atomic_load_explicit(&list->head, memory_order_acquire);
+  struct copy_space_block *head = gc_atomic_load(&list->head);
   struct copy_space_block *next;
   do {
     if (!head)
       return NULL;
-  } while (!atomic_compare_exchange_weak(&list->head, &head, head->next));
+  } while (!gc_atomic_cmpxchg_weak(&list->head, &head, head->next));
   head->next = NULL;
   return head;
 }
@@ -284,18 +283,18 @@ copy_space_page_in_block(struct copy_space *space,
 
 static ssize_t
 copy_space_request_release_memory(struct copy_space *space, size_t bytes) {
-  return atomic_fetch_add(&space->bytes_to_page_out, bytes) + bytes;
+  return gc_atomic_fetch_add(&space->bytes_to_page_out, bytes) + bytes;
 }
 
 static ssize_t
 copy_space_page_out_blocks_until_memory_released(struct copy_space *space) {
-  ssize_t pending = atomic_load(&space->bytes_to_page_out);
+  ssize_t pending = gc_atomic_load(&space->bytes_to_page_out);
   struct gc_lock lock = copy_space_lock(space);
   while (pending > 0) {
     struct copy_space_block *block = copy_space_pop_empty_block(space, &lock);
     if (!block) break;
     copy_space_page_out_block(space, block, &lock);
-    pending = (atomic_fetch_sub(&space->bytes_to_page_out, COPY_SPACE_BLOCK_SIZE)
+    pending = (gc_atomic_fetch_sub(&space->bytes_to_page_out, COPY_SPACE_BLOCK_SIZE)
                - COPY_SPACE_BLOCK_SIZE);
   }
   gc_lock_release(&lock);
@@ -305,14 +304,14 @@ copy_space_page_out_blocks_until_memory_released(struct copy_space *space) {
 static ssize_t
 copy_space_maybe_reacquire_memory(struct copy_space *space, size_t bytes) {
   ssize_t pending =
-    atomic_fetch_sub(&space->bytes_to_page_out, bytes) - bytes;
+    gc_atomic_fetch_sub(&space->bytes_to_page_out, bytes) - bytes;
   struct gc_lock lock = copy_space_lock(space);
   while (pending + COPY_SPACE_BLOCK_SIZE <= 0) {
     struct copy_space_block *block = copy_space_page_in_block(space, &lock);
     if (!block) break;
     copy_space_push_empty_block(space, block, &lock);
-    pending = (atomic_fetch_add(&space->bytes_to_page_out,
-                                COPY_SPACE_BLOCK_SIZE)
+    pending = (gc_atomic_fetch_add(&space->bytes_to_page_out,
+                                   COPY_SPACE_BLOCK_SIZE)
                + COPY_SPACE_BLOCK_SIZE);
   }
   gc_lock_release(&lock);
@@ -327,7 +326,7 @@ copy_space_reacquire_memory(struct copy_space *space, size_t bytes) {
 
 static inline int
 copy_space_contains_address(struct copy_space *space, uintptr_t addr) {
-  return extents_contain_addr(space->extents, addr);
+  return extents_contain_addr(space->extents, addr) != 0;
 }
 
 static inline int
@@ -415,7 +414,7 @@ copy_space_obtain_empty_block_during_gc(struct copy_space *space,
   GC_ASSERT(!copy_space_pop_empty_block(space, lock));
   struct copy_space_block *block = copy_space_page_in_block(space, lock);
   if (block)
-    atomic_fetch_add(&space->bytes_to_page_out, COPY_SPACE_BLOCK_SIZE);
+    gc_atomic_fetch_add(&space->bytes_to_page_out, COPY_SPACE_BLOCK_SIZE);
   return block;
 }
 
@@ -459,11 +458,9 @@ copy_space_allocator_release_full_block(struct copy_space_allocator *alloc,
                                         struct copy_space *space) {
   size_t fragmentation = alloc->limit - alloc->hp;
   size_t allocated = COPY_SPACE_REGION_SIZE - alloc->block->allocated;
-  atomic_fetch_add_explicit(&space->allocated_bytes, allocated,
-                            memory_order_relaxed);
+  gc_atomic_fetch_add_relaxed(&space->allocated_bytes, allocated);
   if (fragmentation)
-    atomic_fetch_add_explicit(&space->fragmentation, fragmentation,
-                              memory_order_relaxed);
+    gc_atomic_fetch_add_relaxed(&space->fragmentation, fragmentation);
   copy_space_push_full_block(space, alloc->block);
   alloc->hp = alloc->limit = 0;
   alloc->block = NULL;
@@ -474,9 +471,8 @@ copy_space_allocator_release_partly_full_block(struct copy_space_allocator *allo
                                                struct copy_space *space) {
   size_t allocated = alloc->hp & (COPY_SPACE_REGION_SIZE - 1);
   if (allocated) {
-    atomic_fetch_add_explicit(&space->allocated_bytes,
-                              allocated - alloc->block->allocated,
-                              memory_order_relaxed);
+    gc_atomic_fetch_add_relaxed(&space->allocated_bytes,
+                                allocated - alloc->block->allocated);
     alloc->block->allocated = allocated;
     struct gc_lock lock = copy_space_lock(space);
     copy_space_push_partly_full_block(space, alloc->block, &lock);
@@ -484,9 +480,8 @@ copy_space_allocator_release_partly_full_block(struct copy_space_allocator *allo
   } else {
     // In this case, hp was bumped all the way to the limit, in which
     // case allocated wraps to 0; the block is full.
-    atomic_fetch_add_explicit(&space->allocated_bytes,
-                              COPY_SPACE_REGION_SIZE - alloc->block->allocated,
-                              memory_order_relaxed);
+    gc_atomic_fetch_add_relaxed(&space->allocated_bytes,
+                                COPY_SPACE_REGION_SIZE - alloc->block->allocated);
     copy_space_push_full_block(space, alloc->block);
   }
   alloc->hp = alloc->limit = 0;
@@ -517,9 +512,11 @@ copy_space_allocate(struct copy_space_allocator *alloc,
   // a small allocation.
 
 done:
-  struct gc_ref ret = gc_ref(alloc->hp);
-  alloc->hp += size;
-  return ret;
+  {
+    struct gc_ref ret = gc_ref(alloc->hp);
+    alloc->hp += size;
+    return ret;
+  }
 }
 
 static struct copy_space_block*
@@ -693,8 +690,7 @@ copy_space_forward_nonatomic(struct copy_space *space, struct gc_edge edge,
     gc_edge_update(edge, gc_ref(forwarded));
     return COPY_SPACE_FORWARD_UPDATED;
   } else {
-    size_t size;
-    gc_trace_object(old_ref, NULL, NULL, NULL, &size);
+    size_t size = gc_trace_object(old_ref, NULL, NULL, NULL);
     struct gc_ref new_ref = copy_space_allocate(alloc, space, size);
     if (gc_ref_is_null(new_ref))
       return COPY_SPACE_FORWARD_FAILED;
@@ -798,12 +794,10 @@ copy_space_remember_edge(struct copy_space *space, struct gc_edge edge) {
   GC_ASSERT(copy_space_contains_edge(space, edge));
   uint8_t* loc = copy_space_field_logged_byte(edge);
   uint8_t bit = copy_space_field_logged_bit(edge);
-  uint8_t byte = atomic_load_explicit(loc, memory_order_acquire);
+  uint8_t byte = gc_atomic_load(loc);
   do {
     if (byte & bit) return 0;
-  } while (!atomic_compare_exchange_weak_explicit(loc, &byte, byte|bit,
-                                                  memory_order_acq_rel,
-                                                  memory_order_acquire));
+  } while (!gc_atomic_cmpxchg_weak(loc, &byte, byte|bit));
   return 1;
 }
 
@@ -812,12 +806,10 @@ copy_space_forget_edge(struct copy_space *space, struct gc_edge edge) {
   GC_ASSERT(copy_space_contains_edge(space, edge));
   uint8_t* loc = copy_space_field_logged_byte(edge);
   uint8_t bit = copy_space_field_logged_bit(edge);
-  uint8_t byte = atomic_load_explicit(loc, memory_order_acquire);
+  uint8_t byte = gc_atomic_load(loc);
   do {
     if (!(byte & bit)) return 0;
-  } while (!atomic_compare_exchange_weak_explicit(loc, &byte, byte&~bit,
-                                                  memory_order_acq_rel,
-                                                  memory_order_acquire));
+  } while (!gc_atomic_cmpxchg_weak(loc, &byte, byte&~bit));
   return 1;
 }
 

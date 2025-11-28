@@ -6,7 +6,18 @@
 #include "gc-attrs.h"
 
 static inline enum gc_inline_allocator_kind gc_inline_allocator_kind(enum gc_allocation_kind kind) {
-  return GC_INLINE_ALLOCATOR_BUMP_POINTER;
+  switch (kind) {
+  case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
+    if (!GC_CONSERVATIVE_TRACE)
+      return GC_INLINE_ALLOCATOR_NONE;
+    // Fall through.
+  case GC_ALLOCATION_TAGGED:
+  case GC_ALLOCATION_TAGGED_POINTERLESS:
+  case GC_ALLOCATION_UNTAGGED_POINTERLESS:
+    return GC_INLINE_ALLOCATOR_BUMP_POINTER;
+  default:
+    GC_CRASH();
+  }
 }
 static inline size_t gc_allocator_small_granule_size(void) {
   return 16;
@@ -36,29 +47,17 @@ static inline uint8_t gc_allocator_alloc_table_begin_pattern(enum gc_allocation_
   uint8_t trace_none = 8;
   uint8_t trace_conservatively = 16;
   uint8_t pinned = 16;
-  if (GC_CONSERVATIVE_TRACE) {
-    switch (kind) {
-      case GC_ALLOCATION_TAGGED:
-      case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
-        return young | trace_conservatively;
-      case GC_ALLOCATION_TAGGED_POINTERLESS:
-      case GC_ALLOCATION_UNTAGGED_POINTERLESS:
-        return young | trace_none;
-      default:
-        GC_CRASH();
-      };
-  } else {
-    switch (kind) {
-      case GC_ALLOCATION_TAGGED:
-        return young | trace_precisely;
-      case GC_ALLOCATION_TAGGED_POINTERLESS:
-        return young | trace_none;
-      case GC_ALLOCATION_UNTAGGED_POINTERLESS:
-        return young | trace_none | pinned;
-      case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
-      default:
-        GC_CRASH();
-    };
+  switch (kind) {
+  case GC_ALLOCATION_TAGGED:
+    return young | trace_precisely;
+  case GC_ALLOCATION_UNTAGGED_CONSERVATIVE:
+    return young | trace_conservatively;
+  case GC_ALLOCATION_TAGGED_POINTERLESS:
+    return young | trace_none;
+  case GC_ALLOCATION_UNTAGGED_POINTERLESS:
+    return young | trace_none | pinned;
+  default:
+    GC_CRASH();
   }
 }
 static inline uint8_t gc_allocator_alloc_table_end_pattern(void) {
@@ -115,6 +114,10 @@ static inline enum gc_cooperative_safepoint_kind gc_cooperative_safepoint_kind(v
 
 static inline int gc_can_pin_objects(void) {
   return 1;
+}
+
+static inline int gc_can_move_objects(void) {
+  return GC_CONSERVATIVE_TRACE ? 0 : 1;
 }
 
 #endif // MMC_ATTRS_H

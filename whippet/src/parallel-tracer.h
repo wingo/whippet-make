@@ -8,9 +8,9 @@
 
 #include "assert.h"
 #include "debug.h"
+#include "gc-atomics.h"
 #include "gc-inline.h"
 #include "gc-tracepoint.h"
-#include "local-worklist.h"
 #include "root-worklist.h"
 #include "shared-worklist.h"
 #include "spin.h"
@@ -40,7 +40,6 @@ struct gc_trace_worker {
   enum trace_worker_state state;
   pthread_mutex_t lock;
   struct shared_worklist shared;
-  struct local_worklist local;
   struct gc_trace_worker_data *data;
 };
 
@@ -53,7 +52,7 @@ gc_trace_worker_data(struct gc_trace_worker *worker) {
 
 struct gc_tracer {
   struct gc_heap *heap;
-  atomic_size_t active_tracers;
+  size_t active_tracers;
   size_t worker_count;
   long epoch;
   pthread_mutex_t lock;
@@ -74,7 +73,6 @@ trace_worker_init(struct gc_trace_worker *worker, struct gc_heap *heap,
   worker->state = TRACE_WORKER_STOPPED;
   pthread_mutex_init(&worker->lock, NULL);
   worker->data = NULL;
-  local_worklist_init(&worker->local);
   return shared_worklist_init(&worker->shared);
 }
 
@@ -88,7 +86,7 @@ trace_worker_thread(void *data) {
 
   pthread_mutex_lock(&worker->lock);
   while (1) {
-    long epoch = atomic_load_explicit(&tracer->epoch, memory_order_acquire);
+    long epoch = gc_atomic_load(&tracer->epoch);
     if (trace_epoch != epoch) {
       trace_epoch = epoch;
       trace_worker_trace(worker);
@@ -112,7 +110,7 @@ static int
 gc_tracer_init(struct gc_tracer *tracer, struct gc_heap *heap,
                size_t parallelism) {
   tracer->heap = heap;
-  atomic_init(&tracer->active_tracers, 0);
+  tracer->active_tracers = 0;
   tracer->epoch = 0;
   tracer->trace_roots_only = 0;
   pthread_mutex_init(&tracer->lock, NULL);
@@ -153,8 +151,7 @@ gc_tracer_add_root(struct gc_tracer *tracer, struct gc_root root) {
 
 static inline void
 tracer_unpark_all_workers(struct gc_tracer *tracer) {
-  long old_epoch =
-    atomic_fetch_add_explicit(&tracer->epoch, 1, memory_order_acq_rel);
+  long old_epoch = gc_atomic_fetch_add(&tracer->epoch, 1);
   long epoch = old_epoch + 1;
   DEBUG("starting trace; %zu workers; epoch=%ld\n", tracer->worker_count,
         epoch);
@@ -164,32 +161,15 @@ tracer_unpark_all_workers(struct gc_tracer *tracer) {
 
 static inline void
 tracer_maybe_unpark_workers(struct gc_tracer *tracer) {
-  size_t active =
-    atomic_load_explicit(&tracer->active_tracers, memory_order_acquire);
+  size_t active = gc_atomic_load(&tracer->active_tracers);
   if (active < tracer->worker_count)
     tracer_unpark_all_workers(tracer);
 }
 
 static inline void
-tracer_share(struct gc_trace_worker *worker) {
-  LOG("tracer #%zu: sharing\n", worker->id);
-  GC_TRACEPOINT(trace_share);
-  size_t to_share = LOCAL_WORKLIST_SHARE_AMOUNT;
-  while (to_share) {
-    struct gc_ref *objv;
-    size_t count = local_worklist_pop_many(&worker->local, &objv, to_share);
-    shared_worklist_push_many(&worker->shared, objv, count);
-    to_share -= count;
-  }
-  tracer_maybe_unpark_workers(worker->tracer);
-}
-
-static inline void
 gc_trace_worker_enqueue(struct gc_trace_worker *worker, struct gc_ref ref) {
   ASSERT(gc_ref_is_heap_object(ref));
-  if (local_worklist_full(&worker->local))
-    tracer_share(worker);
-  local_worklist_push(&worker->local, ref);
+  shared_worklist_push(&worker->shared, ref);
 }
 
 static struct gc_ref
@@ -246,7 +226,7 @@ trace_worker_should_continue(struct gc_trace_worker *worker, size_t spin_count) 
 
   struct gc_tracer *tracer = worker->tracer;
 
-  if (atomic_load_explicit(&tracer->active_tracers, memory_order_acquire) != 1) {
+  if (gc_atomic_load(&tracer->active_tracers) != 1) {
     LOG("checking for termination: tracers active, spinning #%zu\n", spin_count);
     yield_for_spin(spin_count);
     return 1;
@@ -283,16 +263,6 @@ static struct gc_ref
 trace_worker_steal(struct gc_trace_worker *worker) {
   struct gc_tracer *tracer = worker->tracer;
 
-  // It could be that the worker's local trace queue has simply
-  // overflowed.  In that case avoid contention by trying to pop
-  // something from the worker's own queue.
-  {
-    LOG("tracer #%zu: trying to pop worker's own deque\n", worker->id);
-    struct gc_ref obj = shared_worklist_try_pop(&worker->shared);
-    if (!gc_ref_is_null(obj))
-      return obj;
-  }
-
   GC_TRACEPOINT(trace_steal);
   LOG("tracer #%zu: trying to steal\n", worker->id);
   struct gc_ref obj = trace_worker_steal_from_any(worker, tracer);
@@ -307,7 +277,7 @@ trace_with_data(struct gc_tracer *tracer,
                 struct gc_heap *heap,
                 struct gc_trace_worker *worker,
                 struct gc_trace_worker_data *data) {
-  atomic_fetch_add_explicit(&tracer->active_tracers, 1, memory_order_acq_rel);
+  gc_atomic_fetch_add(&tracer->active_tracers, 1);
   worker->data = data;
 
   LOG("tracer #%zu: running trace loop\n", worker->id);
@@ -343,16 +313,17 @@ trace_with_data(struct gc_tracer *tracer,
     size_t spin_count = 0;
     do {
       while (1) {
-        struct gc_ref ref;
-        if (!local_worklist_empty(&worker->local)) {
-          ref = local_worklist_pop(&worker->local);
-        } else {
+        struct gc_ref ref = shared_worklist_try_pop(&worker->shared);
+        if (gc_ref_is_null(ref)) {
           ref = trace_worker_steal(worker);
           if (gc_ref_is_null(ref))
             break;
         }
         trace_one(ref, heap, worker);
         n++;
+        if (worker->id == 0 && n % 128 == 0
+            && shared_worklist_can_steal(&worker->shared))
+          tracer_maybe_unpark_workers(tracer);
       }
     } while (trace_worker_should_continue(worker, spin_count++));
     GC_TRACEPOINT(trace_objects_end);
@@ -361,7 +332,7 @@ trace_with_data(struct gc_tracer *tracer,
   }
 
   worker->data = NULL;
-  atomic_fetch_sub_explicit(&tracer->active_tracers, 1, memory_order_acq_rel);
+  gc_atomic_fetch_sub(&tracer->active_tracers, 1);
 }
 
 static void
@@ -374,26 +345,7 @@ trace_worker_trace(struct gc_trace_worker *worker) {
 
 static inline int
 gc_tracer_should_parallelize(struct gc_tracer *tracer) {
-  if (root_worklist_size(&tracer->roots) > 1)
-    return 1;
-
-  if (tracer->trace_roots_only)
-    return 0;
-
-  size_t nonempty_worklists = 0;
-  ssize_t parallel_threshold =
-    LOCAL_WORKLIST_SIZE - LOCAL_WORKLIST_SHARE_AMOUNT;
-  for (size_t i = 0; i < tracer->worker_count; i++) {
-    ssize_t size = shared_worklist_size(&tracer->workers[i].shared);
-    if (!size)
-      continue;
-    nonempty_worklists++;
-    if (nonempty_worklists > 1)
-      return 1;
-    if (size >= parallel_threshold)
-      return 1;
-  }
-  return 0;
+  return 1;
 }
 
 static inline void
@@ -426,7 +378,7 @@ gc_tracer_trace_roots(struct gc_tracer *tracer) {
   tracer->trace_roots_only = 0;
   GC_TRACEPOINT(trace_roots_end);
   
-  GC_ASSERT_EQ(atomic_load(&tracer->active_tracers), 0);
+  GC_ASSERT_EQ(gc_atomic_load(&tracer->active_tracers), 0);
   LOG("roots-only trace finished\n");
 }
 
